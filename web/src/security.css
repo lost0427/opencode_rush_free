@@ -210,3 +210,310 @@
     margin-left: auto;
   }
 }
+
+.usage-rate-rail {
+  min-width: 430px;
+  min-height: 78px;
+  display: grid;
+  grid-template-columns: minmax(210px, 1fr) 96px 112px;
+  align-items: stretch;
+  color: #f7f3ea;
+  background: #2f342f;
+  border-left: 3px solid var(--accent);
+  box-shadow: 0 9px 24px #25282414;
+}
+.usage-rate-context,
+.usage-rate-value {
+  display: flex;
+  align-items: center;
+}
+.usage-rate-context {
+  gap: 10px;
+  padding: 14px 17px;
+  color: #9fc1aa;
+}
+.usage-rate-context > span {
+  display: grid;
+  gap: 5px;
+}
+.usage-rate-context b {
+  color: #f7f3ea;
+  font-size: 12px;
+}
+.usage-rate-context small {
+  color: #939a91;
+  font:
+    9px "DM Mono",
+    monospace;
+  white-space: nowrap;
+}
+.usage-rate-value {
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  border-left: 1px solid #464c46;
+}
+.usage-rate-value span {
+  color: #9ea59c;
+  font:
+    9px "DM Mono",
+    monospace;
+}
+.usage-rate-value strong {
+  max-width: 100%;
+  color: #fffdf8;
+  font:
+    700 22px "DM Mono",
+    monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.usage-rate-value:last-child strong {
+  color: #e7b29f;
+}
+.usage-filters {
+  display: grid;
+  grid-template-columns: minmax(390px, 1.8fr) minmax(170px, 0.8fr) 140px auto;
+  gap: 13px;
+  align-items: end;
+  margin-bottom: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+.usage-filters label {
+  margin: 0;
+}
+.usage-filter-time,
+.usage-filter-select,
+.usage-custom-range label {
+  display: grid;
+  gap: 8px;
+}
+.usage-filter-time > label,
+.usage-filter-select > span,
+.usage-custom-range label > span {
+  min-height: 15px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #686d65;
+  font-size: 10px;
+}
+.time-segments {
+  min-height: 38px;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  border: 1px solid #d8d4ca;
+  background: #fffdf8;
+}
+.time-segments button {
+  min-width: 0;
+  min-height: 36px;
+  padding: 0 8px;
+  border: 0;
+  border-right: 1px solid #e2ded5;
+  color: #72776f;
+  background: transparent;
+  font:
+    600 10px Manrope,
+    sans-serif;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.time-segments button:last-child {
+  border-right: 0;
+}
+.time-segments button:hover {
+  color: var(--ink);
+  background: #f2efe8;
+}
+.time-segments button.active {
+  color: #f7f3ea;
+  background: var(--green);
+}
+.time-segments button:focus-visible,
+.usage-filter-select select:focus-visible,
+.usage-custom-range input:focus-visible {
+  outline: 2px solid #7c9784;
+  outline-offset: 2px;
+}
+.usage-filter-select select,
+.usage-custom-range input {
+  width: 100%;
+  min-height: 38px;
+  color: var(--ink);
+  background: #fffdf8;
+  border: 1px solid #d8d4ca;
+  border-radius: 2px;
+  padding: 8px 10px;
+  font:
+    11px Manrope,
+    sans-serif;
+}
+.usage-filter-select select {
+  text-overflow: ellipsis;
+}
+.usage-custom-range {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 320px));
+  gap: 13px;
+}
+.usage-filter-actions {
+  min-height: 38px;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+.usage-filter-actions button {
+  justify-content: center;
+  white-space: nowrap;
+}
+.usage-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-color: #c5c1b7 transparent;
+}
+.usage-table {
+  min-width: 1060px;
+}
+.usage-table .table-head,
+.usage-table .table-row {
+  grid-template-columns:
+    minmax(220px, 1.7fr) minmax(120px, 0.8fr) minmax(88px, 0.58fr)
+    minmax(88px, 0.58fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr)
+    minmax(150px, 1fr);
+}
+.usage-table .table-row {
+  min-height: 66px;
+}
+.usage-table .empty {
+  grid-column: 1 / -1;
+}
+.usage-result-cell {
+  min-width: 0;
+}
+.usage-result-cell .request-error {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-number,
+.usage-duration {
+  color: #555b54;
+  font:
+    11px "DM Mono",
+    monospace;
+  white-space: nowrap;
+}
+.usage-duration {
+  color: #465f50;
+}
+.usage-path {
+  display: block;
+  min-width: 0;
+  white-space: nowrap;
+}
+.usage-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+  padding-top: 14px;
+}
+
+@media (max-width: 1100px) {
+  .usage-filters {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .usage-filter-time,
+  .usage-custom-range {
+    grid-column: 1 / -1;
+  }
+  .usage-filter-actions {
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 900px) {
+  .usage-page-intro {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 15px;
+  }
+}
+
+@media (max-width: 760px) {
+  .usage-rate-rail {
+    width: 100%;
+    min-width: 0;
+    grid-template-columns: minmax(180px, 1fr) 82px 96px;
+  }
+  .usage-filters {
+    grid-template-columns: 1fr;
+  }
+  .usage-filter-time,
+  .usage-custom-range {
+    grid-column: auto;
+  }
+  .usage-custom-range {
+    grid-template-columns: 1fr;
+  }
+  .usage-filter-actions {
+    justify-content: stretch;
+  }
+  .usage-filter-actions button {
+    flex: 1;
+  }
+  .usage-pagination {
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 9px;
+  }
+}
+
+@media (max-width: 580px) {
+  .usage-rate-rail {
+    grid-template-columns: 1fr 1fr;
+  }
+  .usage-rate-context {
+    grid-column: 1 / -1;
+    padding: 12px;
+  }
+  .usage-rate-context small {
+    max-width: 145px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .usage-rate-value strong {
+    font-size: 18px;
+  }
+  .usage-rate-value {
+    min-height: 58px;
+    border-top: 1px solid #464c46;
+  }
+  .time-segments {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .time-segments button:nth-child(3) {
+    border-right: 0;
+  }
+  .time-segments button:nth-child(-n + 3) {
+    border-bottom: 1px solid #e2ded5;
+  }
+  .usage-table .table-head,
+  .usage-table .table-row {
+    grid-template-columns:
+      minmax(220px, 1.7fr) minmax(120px, 0.8fr) minmax(88px, 0.58fr)
+      minmax(88px, 0.58fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr)
+      minmax(150px, 1fr);
+  }
+  .usage-table .table-head span:nth-child(3),
+  .usage-table .table-row > span:nth-child(3) {
+    display: block;
+  }
+}

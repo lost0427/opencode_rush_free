@@ -3,12 +3,15 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
+  CalendarRange,
   Check,
   ChevronLeft,
   ChevronRight,
   CircleGauge,
   Copy,
   Database,
+  Filter,
+  FilterX,
   ImageIcon,
   KeyRound,
   LogOut,
@@ -71,9 +74,34 @@ type RequestRow = {
   status: string;
   status_code: number;
   latency_ms: number;
+  first_token_latency_ms?: number;
   retry_count: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
   total_tokens?: number;
   error_message?: string;
+};
+type UsagePage = {
+  items: RequestRow[];
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+  models: string[];
+};
+type UsageRates = {
+  window_seconds: number;
+  rpm: number;
+  tpm: number;
+  measured_at: string;
+};
+type UsageTimePreset = "all" | "1h" | "24h" | "7d" | "30d" | "custom";
+type UsageFilters = {
+  time: UsageTimePreset;
+  model: string;
+  status: "" | "success" | "error";
+  customFrom: string;
+  customTo: string;
 };
 
 const api = async (path: string, init: RequestInit = {}) => {
@@ -227,6 +255,7 @@ function Console({
   const [rows, setRows] = useState<RequestRow[]>([]);
   const [upstream, setUpstream] = useState<any>({});
   const [proxyRefreshToken, setProxyRefreshToken] = useState(0);
+  const [usageRefreshToken, setUsageRefreshToken] = useState(0);
   const load = async () => {
     try {
       const [s, m, r, u] = await Promise.all([
@@ -309,6 +338,7 @@ function Console({
               onClick={() => {
                 load();
                 setProxyRefreshToken((current) => current + 1);
+                setUsageRefreshToken((current) => current + 1);
                 notify("数据已刷新");
               }}
             >
@@ -335,7 +365,13 @@ function Console({
             notify={notify}
           />
         )}{" "}
-        {page === "usage" && <Usage rows={rows} />}{" "}
+        {page === "usage" && (
+          <Usage
+            notify={notify}
+            onLogout={onLogout}
+            refreshToken={usageRefreshToken}
+          />
+        )}{" "}
         {toast && (
           <div className="toast">
             <Check size={15} />
@@ -1269,74 +1305,413 @@ function PasswordCard({ notify }: { notify: (v: string) => void }) {
   );
 }
 
-function Usage({ rows }: { rows: RequestRow[] }) {
-  const [filter, setFilter] = useState("");
-  const shown = useMemo(
-    () =>
-      rows.filter(
-        (r) => !filter || r.model.toLowerCase().includes(filter.toLowerCase()),
-      ),
-    [rows, filter],
+const usageTimeOptions: Array<{ value: UsageTimePreset; label: string }> = [
+  { value: "all", label: "全部" },
+  { value: "1h", label: "近 1 小时" },
+  { value: "24h", label: "近 24 小时" },
+  { value: "7d", label: "近 7 天" },
+  { value: "30d", label: "近 30 天" },
+  { value: "custom", label: "自定义" },
+];
+
+const emptyUsageFilters = (): UsageFilters => ({
+  time: "all",
+  model: "",
+  status: "",
+  customFrom: "",
+  customTo: "",
+});
+
+const formatDuration = (milliseconds?: number) => {
+  if (milliseconds === undefined || milliseconds === null) return "—";
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  return `${new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(milliseconds / 1000)} s`;
+};
+
+function Usage({
+  notify,
+  onLogout,
+  refreshToken,
+}: {
+  notify: (value: string) => void;
+  onLogout: () => void;
+  refreshToken: number;
+}) {
+  const [rows, setRows] = useState<RequestRow[]>([]);
+  const [models, setModels] = useState<string[]>([]);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const [loading, setLoading] = useState(true);
+  const [draftFilters, setDraftFilters] = useState<UsageFilters>(
+    emptyUsageFilters,
   );
+  const [appliedFilters, setAppliedFilters] = useState<UsageFilters>(
+    emptyUsageFilters,
+  );
+  const [rates, setRates] = useState<UsageRates>({
+    window_seconds: 60,
+    rpm: 0,
+    tpm: 0,
+    measured_at: "",
+  });
+
+  const requestPath = useMemo(() => {
+    const params = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    const durations: Partial<Record<UsageTimePreset, number>> = {
+      "1h": 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+      "30d": 30 * 24 * 60 * 60 * 1000,
+    };
+    const duration = durations[appliedFilters.time];
+    if (duration) {
+      params.set("from", new Date(Date.now() - duration).toISOString());
+    } else if (appliedFilters.time === "custom") {
+      params.set("from", new Date(appliedFilters.customFrom).toISOString());
+      params.set("to", new Date(appliedFilters.customTo).toISOString());
+    }
+    if (appliedFilters.model) params.set("model", appliedFilters.model);
+    if (appliedFilters.status) params.set("status", appliedFilters.status);
+    return `/api/usage/requests?${params.toString()}`;
+  }, [appliedFilters, page, pageSize, refreshToken]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setLoading(true);
+    api(requestPath, { signal: controller.signal })
+      .then((data: UsagePage) => {
+        if (!active) return;
+        setRows(data.items);
+        setModels(data.models);
+        setTotal(data.total);
+        setTotalPages(data.total_pages);
+        if (data.page !== page) setPage(data.page);
+      })
+      .catch((error) => {
+        if ((error as Error).name === "AbortError") return;
+        if ((error as Error).message === "AUTH") {
+          onLogout();
+          return;
+        }
+        notify((error as Error).message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [requestPath]);
+
+  useEffect(() => {
+    let active = true;
+    const loadRates = async () => {
+      try {
+        const data = (await api("/api/usage/rates")) as UsageRates;
+        if (active) setRates(data);
+      } catch (error) {
+        if ((error as Error).message === "AUTH") onLogout();
+      }
+    };
+    void loadRates();
+    const timer = window.setInterval(loadRates, 10_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [refreshToken]);
+
+  const applyFilters = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (draftFilters.time === "custom") {
+      if (!draftFilters.customFrom || !draftFilters.customTo) {
+        notify("请选择自定义时间的开始和结束");
+        return;
+      }
+      const from = new Date(draftFilters.customFrom);
+      const to = new Date(draftFilters.customTo);
+      if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+        notify("自定义时间格式无效");
+        return;
+      }
+      if (from > to) {
+        notify("开始时间不能晚于结束时间");
+        return;
+      }
+    }
+    setAppliedFilters({ ...draftFilters });
+    setPage(1);
+  };
+
+  const clearFilters = () => {
+    const cleared = emptyUsageFilters();
+    setDraftFilters(cleared);
+    setAppliedFilters(cleared);
+    setPage(1);
+  };
+
   return (
     <div className="page">
-      <div className="page-intro">
+      <div className="page-intro usage-page-intro">
         <div>
           <div className="eyebrow">AUDIT TRAIL</div>
           <h1>使用记录</h1>
-          <p>只记录请求元数据，保留路径与成本的可见性。</p>
+          <p>按模型、时间与结果检查每次上游调用的吞吐和响应速度。</p>
         </div>
-        <div className="search">
-          <Activity size={15} />
-          <input
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="筛选模型…"
-          />
+        <div className="usage-rate-rail" aria-label="最近 60 秒速率">
+          <div className="usage-rate-context">
+            <Activity size={16} />
+            <span>
+              <b>实时速率</b>
+              <small>
+                全局最近 {rates.window_seconds} 秒
+                {rates.measured_at
+                  ? ` · ${new Date(rates.measured_at).toLocaleTimeString()}`
+                  : ""}
+              </small>
+            </span>
+          </div>
+          <div className="usage-rate-value">
+            <span>RPM</span>
+            <strong>{fmt(rates.rpm)}</strong>
+          </div>
+          <div className="usage-rate-value">
+            <span>TPM</span>
+            <strong>{fmt(rates.tpm)}</strong>
+          </div>
         </div>
       </div>
       <section className="panel">
+        <form className="usage-filters" onSubmit={applyFilters}>
+          <div className="usage-filter-time">
+            <label>
+              <CalendarRange size={14} /> 时间范围
+            </label>
+            <div className="time-segments" role="group" aria-label="时间范围">
+              {usageTimeOptions.map((option) => (
+                <button
+                  type="button"
+                  key={option.value}
+                  className={draftFilters.time === option.value ? "active" : ""}
+                  aria-pressed={draftFilters.time === option.value}
+                  onClick={() =>
+                    setDraftFilters((current) => ({
+                      ...current,
+                      time: option.value,
+                    }))
+                  }
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="usage-filter-select">
+            <span>模型</span>
+            <select
+              value={draftFilters.model}
+              onChange={(event) =>
+                setDraftFilters((current) => ({
+                  ...current,
+                  model: event.target.value,
+                }))
+              }
+            >
+              <option value="">全部模型</option>
+              {models.map((model) => (
+                <option value={model} key={model}>
+                  {model}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="usage-filter-select usage-result-filter">
+            <span>请求结果</span>
+            <select
+              value={draftFilters.status}
+              onChange={(event) =>
+                setDraftFilters((current) => ({
+                  ...current,
+                  status: event.target.value as UsageFilters["status"],
+                }))
+              }
+            >
+              <option value="">全部结果</option>
+              <option value="success">成功</option>
+              <option value="error">失败</option>
+            </select>
+          </label>
+          {draftFilters.time === "custom" && (
+            <div className="usage-custom-range">
+              <label>
+                <span>开始时间</span>
+                <input
+                  type="datetime-local"
+                  value={draftFilters.customFrom}
+                  onChange={(event) =>
+                    setDraftFilters((current) => ({
+                      ...current,
+                      customFrom: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>结束时间</span>
+                <input
+                  type="datetime-local"
+                  value={draftFilters.customTo}
+                  onChange={(event) =>
+                    setDraftFilters((current) => ({
+                      ...current,
+                      customTo: event.target.value,
+                    }))
+                  }
+                />
+              </label>
+            </div>
+          )}
+          <div className="usage-filter-actions">
+            <button className="primary" type="submit" disabled={loading}>
+              <Filter size={14} />
+              应用筛选
+            </button>
+            <button
+              className="secondary"
+              type="button"
+              onClick={clearFilters}
+              disabled={loading}
+            >
+              <FilterX size={14} />
+              清除
+            </button>
+          </div>
+        </form>
         <div className="panel-head">
           <div>
             <h3>Requests</h3>
-            <p className="muted">最近 25 条记录</p>
+            <p className="muted">全部历史记录 · 最新完成优先</p>
           </div>
-          <span className="count-chip">{shown.length} shown</span>
+          <span className="count-chip">{fmt(total)} records</span>
         </div>
-        <div className="data-table usage-table">
-          <div className="table-head">
-            <span>模型 / 时间</span>
-            <span>结果</span>
-            <span>路径</span>
-            <span>Token</span>
-            <span>延迟</span>
-          </div>
-          {shown.map((r) => (
-            <div className="table-row" key={r.id}>
-              <div>
-                <div className="request-model-line">
-                  <b>{r.model}</b>
-                  {r.request_kind === "vision_helper" && (
-                    <span className="helper-tag">图片辅助</span>
+        <div className="usage-table-scroll">
+          <div className={`data-table usage-table ${loading ? "is-loading" : ""}`}>
+            <div className="table-head">
+              <span>模型 / 完成时间</span>
+              <span>请求结果</span>
+              <span>输入 Token</span>
+              <span>输出 Token</span>
+              <span>首字耗时</span>
+              <span>总耗时</span>
+              <span>路径</span>
+            </div>
+            {rows.map((r) => (
+              <div className="table-row" key={r.id}>
+                <div>
+                  <div className="request-model-line">
+                    <b title={r.model}>{r.model}</b>
+                    {r.request_kind === "vision_helper" && (
+                      <span className="helper-tag">图片辅助</span>
+                    )}
+                  </div>
+                  <small>{new Date(r.created_at).toLocaleString()}</small>
+                </div>
+                <div className="usage-result-cell">
+                  <span
+                    className={`health ${r.status === "success" ? "healthy" : "cooldown"}`}
+                  >
+                    <i />
+                    {r.status === "success" ? "success" : `HTTP ${r.status_code}`}
+                  </span>
+                  {r.error_message && (
+                    <small className="request-error" title={r.error_message}>
+                      {r.error_message}
+                    </small>
                   )}
                 </div>
-                <small>{new Date(r.created_at).toLocaleString()}</small>
+                <span className="usage-number">
+                  {r.prompt_tokens === undefined ? "—" : fmt(r.prompt_tokens)}
+                </span>
+                <span className="usage-number">
+                  {r.completion_tokens === undefined
+                    ? "—"
+                    : fmt(r.completion_tokens)}
+                </span>
+                <span className="usage-duration">
+                  {formatDuration(r.first_token_latency_ms)}
+                </span>
+                <span className="usage-duration">
+                  {formatDuration(r.latency_ms)}
+                </span>
+                <span className="mono tiny usage-path" title={r.proxy_uri || "direct"}>
+                  {r.proxy_uri || "direct"}
+                </span>
               </div>
-              <span
-                className={`health ${r.status === "success" ? "healthy" : "cooldown"}`}
-              >
-                <i />
-                {r.status === "success" ? "success" : `HTTP ${r.status_code}`}
-                {r.error_message && (
-                  <small className="request-error">{r.error_message}</small>
-                )}
-              </span>
-              <span className="mono tiny">{r.proxy_uri || "direct"}</span>
-              <span>{r.total_tokens ? fmt(r.total_tokens) : "—"}</span>
-              <span>{r.latency_ms} ms</span>
-            </div>
-          ))}
-          {shown.length === 0 && <Empty text="暂无匹配记录" />}
+            ))}
+            {loading && rows.length === 0 && <Empty text="正在加载使用记录…" />}
+            {!loading && rows.length === 0 && (
+              <Empty text="当前筛选条件下没有使用记录" />
+            )}
+          </div>
+        </div>
+        <div className="usage-pagination" aria-label="使用记录分页">
+          <span className="pagination-range" aria-live="polite">
+            {total === 0
+              ? "0 / 0"
+              : `${(page - 1) * pageSize + 1}-${Math.min(page * pageSize, total)} / ${fmt(total)}`}
+          </span>
+          <label className="page-size-control">
+            <span>每页</span>
+            <select
+              value={pageSize}
+              disabled={loading}
+              onChange={(event) => {
+                setPageSize(Number(event.target.value));
+                setPage(1);
+              }}
+            >
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+            </select>
+          </label>
+          <div className="page-navigation">
+            <button
+              className="icon-btn"
+              type="button"
+              title="上一页"
+              aria-label="上一页"
+              disabled={loading || page <= 1}
+              onClick={() => setPage((current) => Math.max(1, current - 1))}
+            >
+              <ChevronLeft size={16} />
+            </button>
+            <span className="page-indicator">
+              第 {page} / {totalPages} 页
+            </span>
+            <button
+              className="icon-btn"
+              type="button"
+              title="下一页"
+              aria-label="下一页"
+              disabled={loading || page >= totalPages}
+              onClick={() =>
+                setPage((current) => Math.min(totalPages, current + 1))
+              }
+            >
+              <ChevronRight size={16} />
+            </button>
+          </div>
         </div>
       </section>
     </div>

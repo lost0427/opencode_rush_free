@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -45,6 +46,66 @@ func testApp(t *testing.T) *App {
 	}
 	t.Cleanup(func() { db.Close() })
 	return a
+}
+
+func insertUsageAt(t *testing.T, a *App, createdAt time.Time, model, status string, totalTokens *int64) {
+	t.Helper()
+	statusCode := http.StatusOK
+	if status == "error" {
+		statusCode = http.StatusBadGateway
+	}
+	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,status,status_code,latency_ms,retry_count,total_tokens) VALUES(?,?,?,?,?,?,?,?)", createdAt.UTC().Format(time.RFC3339), "chat", model, status, statusCode, 100, 0, totalTokens); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMigrateAddsFirstTokenLatencyToExistingUsageTable(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:legacy-usage-migration?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE usage_requests (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		created_at TEXT NOT NULL,
+		model TEXT NOT NULL,
+		status TEXT NOT NULL,
+		status_code INTEGER NOT NULL DEFAULT 0,
+		latency_ms INTEGER NOT NULL DEFAULT 0,
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		prompt_tokens INTEGER,
+		completion_tokens INTEGER,
+		total_tokens INTEGER,
+		error_message TEXT
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query("PRAGMA table_info(usage_requests)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if name == "first_token_latency_ms" {
+			found = true
+			if notNull != 0 {
+				t.Fatal("first_token_latency_ms must remain nullable for historical rows")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("migration did not add first_token_latency_ms")
+	}
 }
 
 func TestProxyParserSanitizesCredentials(t *testing.T) {
@@ -148,7 +209,8 @@ func TestVisionRequestContextSurvivesClientCancellation(t *testing.T) {
 func TestUsageRecordsDistinguishVisionHelper(t *testing.T) {
 	a := testApp(t)
 	prompt, completion, total := int64(4), int64(6), int64(10)
-	a.recordUsageKind("vision_helper", "vision-provider/model", nil, "", "success", http.StatusOK, 120*time.Millisecond, 0, &tokenUsage{Prompt: &prompt, Completion: &completion, Total: &total}, nil)
+	firstToken := 42 * time.Millisecond
+	a.recordUsageKind("vision_helper", "vision-provider/model", nil, "", "success", http.StatusOK, 120*time.Millisecond, &firstToken, 0, &tokenUsage{Prompt: &prompt, Completion: &completion, Total: &total}, nil)
 	list := httptest.NewRecorder()
 	a.usageList(list, httptest.NewRequest(http.MethodGet, "/api/usage/requests?limit=10", nil))
 	if list.Code != http.StatusOK {
@@ -158,8 +220,148 @@ func TestUsageRecordsDistinguishVisionHelper(t *testing.T) {
 	if err := json.NewDecoder(list.Body).Decode(&rows); err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].RequestKind != "vision_helper" || rows[0].Model != "vision-provider/model" || rows[0].TotalTokens == nil || *rows[0].TotalTokens != 10 {
+	if len(rows) != 1 || rows[0].RequestKind != "vision_helper" || rows[0].Model != "vision-provider/model" || rows[0].PromptTokens == nil || *rows[0].PromptTokens != 4 || rows[0].CompletionTokens == nil || *rows[0].CompletionTokens != 6 || rows[0].TotalTokens == nil || *rows[0].TotalTokens != 10 || rows[0].FirstTokenLatencyMS == nil || *rows[0].FirstTokenLatencyMS != 42 {
 		t.Fatalf("vision helper usage was not recorded separately: %#v", rows)
+	}
+}
+
+func TestSSEContentDetectorFindsFirstNonEmptyContentAcrossChunks(t *testing.T) {
+	detector := &sseContentDetector{}
+	if detector.Observe([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n")) {
+		t.Fatal("empty role event was treated as first content")
+	}
+	if detector.Observe([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n")) {
+		t.Fatal("reasoning metadata was treated as first content")
+	}
+	if detector.Observe([]byte("data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"te")) {
+		t.Fatal("partial SSE event was treated as complete")
+	}
+	if !detector.Observe([]byte("xt\":\"hello\"}]}}]}\n")) {
+		t.Fatal("text content split across reads was not detected")
+	}
+	if detector.Observe([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"again\"}}]}\n")) {
+		t.Fatal("detector fired more than once")
+	}
+
+	withoutNewline := &sseContentDetector{}
+	if withoutNewline.Observe([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}")) {
+		t.Fatal("unterminated event was processed before flush")
+	}
+	if !withoutNewline.Flush() {
+		t.Fatal("final unterminated event was not detected on flush")
+	}
+}
+
+func TestUsageListPaginationAndCombinedFilters(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	ten, twenty := int64(10), int64(20)
+	insertUsageAt(t, a, now.Add(-2*time.Hour), "model-a", "success", &ten)
+	insertUsageAt(t, a, now.Add(-45*time.Minute), "model-a", "success", &ten)
+	insertUsageAt(t, a, now.Add(-30*time.Minute), "model-a", "success", &twenty)
+	insertUsageAt(t, a, now.Add(-10*time.Minute), "model-a", "error", nil)
+	insertUsageAt(t, a, now.Add(-5*time.Minute), "model-b", "success", &twenty)
+
+	params := url.Values{
+		"page":      {"2"},
+		"page_size": {"1"},
+		"from":      {now.Add(-time.Hour).Format(time.RFC3339)},
+		"model":     {"model-a"},
+		"status":    {"success"},
+	}
+	recorder := httptest.NewRecorder()
+	a.usageList(recorder, httptest.NewRequest(http.MethodGet, "/api/usage/requests?"+params.Encode(), nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("filtered usage page failed: %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Items      []usageRequest `json:"items"`
+		Page       int            `json:"page"`
+		PageSize   int            `json:"page_size"`
+		Total      int            `json:"total"`
+		TotalPages int            `json:"total_pages"`
+		Models     []string       `json:"models"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Page != 2 || response.PageSize != 1 || response.Total != 2 || response.TotalPages != 2 || len(response.Items) != 1 {
+		t.Fatalf("unexpected filtered page: %#v", response)
+	}
+	if !response.Items[0].CreatedAt.Equal(now.Add(-45*time.Minute)) || response.Items[0].Model != "model-a" {
+		t.Fatalf("wrong filtered item: %#v", response.Items[0])
+	}
+	if len(response.Models) != 2 || response.Models[0] != "model-a" || response.Models[1] != "model-b" {
+		t.Fatalf("historical model options were not returned: %#v", response.Models)
+	}
+
+	last := httptest.NewRecorder()
+	a.usageList(last, httptest.NewRequest(http.MethodGet, "/api/usage/requests?page=99&page_size=2", nil))
+	var lastPage struct {
+		Page  int            `json:"page"`
+		Items []usageRequest `json:"items"`
+	}
+	if err := json.NewDecoder(last.Body).Decode(&lastPage); err != nil {
+		t.Fatal(err)
+	}
+	if lastPage.Page != 3 || len(lastPage.Items) != 1 {
+		t.Fatalf("out-of-range usage page was not clamped: %#v", lastPage)
+	}
+
+	legacy := httptest.NewRecorder()
+	a.usageList(legacy, httptest.NewRequest(http.MethodGet, "/api/usage/requests?limit=1", nil))
+	var legacyRows []usageRequest
+	if err := json.NewDecoder(legacy.Body).Decode(&legacyRows); err != nil {
+		t.Fatalf("legacy usage response changed shape: %v; body=%s", err, legacy.Body.String())
+	}
+	if len(legacyRows) != 1 {
+		t.Fatalf("legacy usage limit was not preserved: %#v", legacyRows)
+	}
+}
+
+func TestUsageListRejectsInvalidPaginationAndFilters(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	cases := []string{
+		"/api/usage/requests?page=0&page_size=25",
+		"/api/usage/requests?page=1&page_size=201",
+		"/api/usage/requests?page=1&status=unknown",
+		"/api/usage/requests?page=1&from=not-a-time",
+		"/api/usage/requests?page=1&from=" + url.QueryEscape(now.Format(time.RFC3339)) + "&to=" + url.QueryEscape(now.Add(-time.Hour).Format(time.RFC3339)),
+	}
+	for _, path := range cases {
+		recorder := httptest.NewRecorder()
+		a.usageList(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("expected invalid query to fail: path=%s status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestUsageRatesUseRollingSixtySecondWindow(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	ten, fifty := int64(10), int64(50)
+	insertUsageAt(t, a, now.Add(-10*time.Second), "model-a", "success", &ten)
+	insertUsageAt(t, a, now.Add(-20*time.Second), "vision-model", "error", nil)
+	insertUsageAt(t, a, now.Add(-2*time.Minute), "model-b", "success", &fifty)
+
+	recorder := httptest.NewRecorder()
+	a.usageRates(recorder, httptest.NewRequest(http.MethodGet, "/api/usage/rates", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("usage rates failed: %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		WindowSeconds int    `json:"window_seconds"`
+		RPM           int64  `json:"rpm"`
+		TPM           int64  `json:"tpm"`
+		MeasuredAt    string `json:"measured_at"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.WindowSeconds != 60 || response.RPM != 2 || response.TPM != 10 || response.MeasuredAt == "" {
+		t.Fatalf("unexpected rolling usage rates: %#v", response)
 	}
 }
 
@@ -592,9 +794,12 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 		Body: io.NopCloser(bytes.NewReader(payload)),
 	}
 	recorder := httptest.NewRecorder()
-	_, _, copyErr := a.copyResponse(recorder, resp)
+	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now())
 	if copyErr != nil {
 		t.Fatal(copyErr)
+	}
+	if firstToken == nil {
+		t.Fatal("non-streaming response did not record its first body byte")
 	}
 	if recorder.Body.Len() != len(payload) {
 		t.Fatalf("response was truncated: got=%d want=%d", recorder.Body.Len(), len(payload))
@@ -604,6 +809,46 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 	}
 	if recorder.Header().Get("X-Upstream") != "keep-me" {
 		t.Fatal("safe upstream header was removed")
+	}
+}
+
+func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
+	a := testApp(t)
+	stream := strings.Join([]string{
+		`data: {"choices":[{"delta":{"role":"assistant","content":""}}]}`,
+		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
+		`data: {"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3},"choices":[]}`,
+		"data: [DONE]",
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(stream)),
+	}
+	recorder := httptest.NewRecorder()
+	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond))
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	if firstToken == nil || *firstToken < 40*time.Millisecond {
+		t.Fatalf("streaming first content latency was not captured: %v", firstToken)
+	}
+	if usage == nil || usage.Prompt == nil || *usage.Prompt != 2 || usage.Completion == nil || *usage.Completion != 1 {
+		t.Fatalf("streaming usage was not preserved: %#v", usage)
+	}
+
+	errorResp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream failed"}}`)),
+	}
+	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second))
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	if errorFirstToken != nil {
+		t.Fatalf("error body recorded a first token latency: %v", *errorFirstToken)
 	}
 }
 
@@ -629,7 +874,7 @@ func TestUsageKeepsProxySnapshotAfterDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.recordUsage("model:free", &id, p.URI, "success", 200, time.Millisecond, 0, nil, nil)
+	a.recordUsage("model:free", &id, p.URI, "success", 200, time.Millisecond, nil, 0, nil, nil)
 	if _, err := a.db.Exec("DELETE FROM proxies WHERE id=?", id); err != nil {
 		t.Fatal(err)
 	}
