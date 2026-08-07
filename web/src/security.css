@@ -44,6 +44,30 @@
 .vision-helper-note {
   margin-top: 4px;
 }
+.vision-proxy-toggle {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  width: fit-content;
+  margin: 14px 0 0;
+  cursor: pointer;
+}
+.vision-proxy-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: #355f48;
+}
+.vision-proxy-toggle span {
+  display: grid;
+  gap: 2px;
+}
+.vision-proxy-toggle b {
+  font-size: 13px;
+}
+.vision-proxy-toggle small {
+  color: #5d6b61;
+}
 .expiry-controls {
   display: flex;
   gap: 12px;

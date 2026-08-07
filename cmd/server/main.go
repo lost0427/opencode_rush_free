@@ -81,15 +81,16 @@ type ModelRecord struct {
 }
 
 type upstreamConfig struct {
-	BaseURL       string
-	APIKey        string
-	VisionBaseURL string
-	VisionAPIKey  string
-	VisionModel   string
-	CustomHeaders map[string]string
-	UpdatedAt     time.Time
-	LastRefresh   *time.Time
-	LastError     string
+	BaseURL        string
+	APIKey         string
+	VisionBaseURL  string
+	VisionAPIKey   string
+	VisionModel    string
+	VisionUseProxy bool
+	CustomHeaders  map[string]string
+	UpdatedAt      time.Time
+	LastRefresh    *time.Time
+	LastError      string
 }
 
 type usageRequest struct {
@@ -727,7 +728,7 @@ func (a *App) getUpstream(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not count models"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"base_url": cfg.BaseURL, "has_api_key": cfg.APIKey != "", "vision_base_url": cfg.VisionBaseURL, "has_vision_api_key": cfg.VisionAPIKey != "", "vision_model": cfg.VisionModel, "vision_configured": cfg.VisionBaseURL != "" && cfg.VisionModel != "", "custom_headers": cfg.CustomHeaders, "last_model_refresh_at": cfg.LastRefresh, "last_model_refresh_error": cfg.LastError, "free_model_count": models, "gateway_base_url": "/v1", "client_key_configured": a.clientKeyConfigured(), "session_proxy_request_limit": a.sessionProxyRequestLimit()})
+	writeJSON(w, 200, map[string]any{"base_url": cfg.BaseURL, "has_api_key": cfg.APIKey != "", "vision_base_url": cfg.VisionBaseURL, "has_vision_api_key": cfg.VisionAPIKey != "", "vision_model": cfg.VisionModel, "vision_use_proxy": cfg.VisionUseProxy, "vision_configured": cfg.VisionBaseURL != "" && cfg.VisionModel != "", "custom_headers": cfg.CustomHeaders, "last_model_refresh_at": cfg.LastRefresh, "last_model_refresh_error": cfg.LastError, "free_model_count": models, "gateway_base_url": "/v1", "client_key_configured": a.clientKeyConfigured(), "session_proxy_request_limit": a.sessionProxyRequestLimit()})
 }
 
 func (a *App) putRouting(w http.ResponseWriter, r *http.Request) {
@@ -778,12 +779,13 @@ func (a *App) rotateClientKey(w http.ResponseWriter, _ *http.Request) {
 }
 func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		BaseURL       string             `json:"base_url"`
-		APIKey        string             `json:"api_key"`
-		VisionBaseURL string             `json:"vision_base_url"`
-		VisionAPIKey  string             `json:"vision_api_key"`
-		VisionModel   string             `json:"vision_model"`
-		CustomHeaders *map[string]string `json:"custom_headers"`
+		BaseURL        string             `json:"base_url"`
+		APIKey         string             `json:"api_key"`
+		VisionBaseURL  string             `json:"vision_base_url"`
+		VisionAPIKey   string             `json:"vision_api_key"`
+		VisionModel    string             `json:"vision_model"`
+		VisionUseProxy *bool              `json:"vision_use_proxy"`
+		CustomHeaders  *map[string]string `json:"custom_headers"`
 	}
 	if readJSON(r, &in) != nil || in.BaseURL == "" {
 		writeJSON(w, 400, map[string]string{"error": "base_url is required"})
@@ -816,6 +818,10 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 	if in.APIKey == "" {
 		in.APIKey = old.APIKey
 	}
+	visionUseProxy := old.VisionUseProxy
+	if in.VisionUseProxy != nil {
+		visionUseProxy = *in.VisionUseProxy
+	}
 	headers := old.CustomHeaders
 	if in.CustomHeaders != nil {
 		var headerErr error
@@ -845,7 +851,7 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "vision encryption failed"})
 		return
 	}
-	_, e = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('upstream_base_url',?),('upstream_api_key',?),('upstream_vision_base_url',?),('upstream_vision_api_key',?),('upstream_vision_model',?),('upstream_custom_headers',?)", normalizedBaseURL, enc, in.VisionBaseURL, visionEnc, in.VisionModel, headersEnc)
+	_, e = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('upstream_base_url',?),('upstream_api_key',?),('upstream_vision_base_url',?),('upstream_vision_api_key',?),('upstream_vision_model',?),('upstream_vision_use_proxy',?),('upstream_custom_headers',?)", normalizedBaseURL, enc, in.VisionBaseURL, visionEnc, in.VisionModel, strconv.FormatBool(visionUseProxy), headersEnc)
 	if e != nil {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
@@ -853,7 +859,7 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *App) loadUpstream() (upstreamConfig, error) {
-	cfg := upstreamConfig{CustomHeaders: defaultHeaders()}
+	cfg := upstreamConfig{CustomHeaders: defaultHeaders(), VisionUseProxy: true}
 	var b, e string
 	err := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_base_url'").Scan(&b)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -903,6 +909,15 @@ func (a *App) loadUpstream() (upstreamConfig, error) {
 	}
 	if visionErr := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_vision_model'").Scan(&visionModel); visionErr != nil && !errors.Is(visionErr, sql.ErrNoRows) {
 		return cfg, visionErr
+	}
+	var visionUseProxyRaw string
+	if visionErr := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_vision_use_proxy'").Scan(&visionUseProxyRaw); visionErr != nil && !errors.Is(visionErr, sql.ErrNoRows) {
+		return cfg, visionErr
+	}
+	if visionUseProxyRaw != "" {
+		if visionUseProxy, parseErr := strconv.ParseBool(visionUseProxyRaw); parseErr == nil {
+			cfg.VisionUseProxy = visionUseProxy
+		}
 	}
 	var lr, le string
 	if refreshErr := a.db.QueryRow("SELECT value FROM settings WHERE key='last_model_refresh_at'").Scan(&lr); refreshErr != nil && !errors.Is(refreshErr, sql.ErrNoRows) {
@@ -1456,23 +1471,34 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		bodyToForward := body
 		if visionEnabled {
 			helperStarted := time.Now()
+			helperProxy := p
+			var helperProxyID *int64 = &p.ID
+			helperProxyURI := p.URI
+			if !cfg.VisionUseProxy {
+				helperProxy = ProxyRecord{}
+				helperProxyID = nil
+				helperProxyURI = ""
+			}
 			helpBody, buildErr := buildVisionRequest(body, cfg.VisionModel)
 			if buildErr != nil {
 				lastErr = buildErr
-				a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "error", 0, time.Since(helperStarted), nil, i, nil, buildErr)
+				a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "error", 0, time.Since(helperStarted), nil, i, nil, buildErr)
 				break
 			}
 			visionCfg := upstreamConfig{BaseURL: cfg.VisionBaseURL, APIKey: cfg.VisionAPIKey}
 			helperCtx, helperCancel := visionRequestContext(r)
 			helperRequest := r.Clone(helperCtx)
-			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, p)
+			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, helperProxy)
 			if helpErr != nil {
 				helperCancel()
 				lastErr = fmt.Errorf("vision helper request failed: %w", helpErr)
-				a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "error", 0, time.Since(helperStarted), nil, i, nil, lastErr)
-				a.markProxyFailure(p.ID)
-				a.clearSessionProxy(requestSessionKey, p.ID)
-				continue
+				a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "error", 0, time.Since(helperStarted), nil, i, nil, lastErr)
+				if cfg.VisionUseProxy {
+					a.markProxyFailure(p.ID)
+					a.clearSessionProxy(requestSessionKey, p.ID)
+					continue
+				}
+				break
 			}
 			var helpFirstToken *time.Duration
 			helpReader := io.Reader(io.LimitReader(helpResp.Body, 4<<20))
@@ -1489,8 +1515,11 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			helperCancel()
 			if readErr != nil {
 				lastErr = fmt.Errorf("vision helper response failed: %w", readErr)
-				a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
-				continue
+				a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
+				if cfg.VisionUseProxy {
+					continue
+				}
+				break
 			}
 			if helpStatus >= 300 {
 				detail := upstreamErrorSummary(helpCaptured)
@@ -1498,8 +1527,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 					detail = fmt.Sprintf("upstream returned HTTP %d", helpStatus)
 				}
 				lastErr = fmt.Errorf("vision helper failed: %s", detail)
-				a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
-				if helpStatus == http.StatusTooManyRequests && i+1 < attempts {
+				a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
+				if cfg.VisionUseProxy && helpStatus == http.StatusTooManyRequests && i+1 < attempts {
 					a.clearSessionProxy(requestSessionKey, p.ID)
 					continue
 				}
@@ -1508,16 +1537,16 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			description, extractErr := extractVisionDescription(helpCaptured)
 			if extractErr != nil {
 				lastErr = extractErr
-				a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
+				a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
 				break
 			}
 			bodyToForward, buildErr = replaceImageContent(body, description)
 			if buildErr != nil {
 				lastErr = buildErr
-				a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
+				a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
 				break
 			}
-			a.recordUsageKind("vision_helper", cfg.VisionModel, &p.ID, p.URI, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
+			a.recordUsageKind("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
 		resp, e := a.forward(r, bodyToForward, cfg, p)
 		if e != nil {
@@ -1718,14 +1747,17 @@ func addTokenValue(first, second *int64) *int64 {
 }
 
 func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	tr.ResponseHeaderTimeout = 90 * time.Second
+	if strings.TrimSpace(p.URI) == "" {
+		tr.Proxy = nil
+		return &http.Client{Transport: tr}, nil
+	}
 	u, err := url.Parse(p.URI)
 	if err != nil {
 		return nil, err
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.Proxy = http.ProxyFromEnvironment
-	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	tr.ResponseHeaderTimeout = 90 * time.Second
 	if u.Scheme == "socks5" || u.Scheme == "socks5h" {
 		var auth *proxy.Auth
 		if p.Username != "" {

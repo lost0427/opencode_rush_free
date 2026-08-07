@@ -944,6 +944,9 @@ function Models({
   const [visionBase, setVisionBase] = useState(upstream.vision_base_url || "");
   const [visionKey, setVisionKey] = useState("");
   const [visionModel, setVisionModel] = useState(upstream.vision_model || "");
+  const [visionUseProxy, setVisionUseProxy] = useState(
+    upstream.vision_use_proxy !== false,
+  );
   const [headers, setHeaders] = useState(() =>
     headersToText(upstream.custom_headers),
   );
@@ -954,12 +957,14 @@ function Models({
     setBase(upstream.base_url || "");
     setVisionBase(upstream.vision_base_url || "");
     setVisionModel(upstream.vision_model || "");
+    setVisionUseProxy(upstream.vision_use_proxy !== false);
     setHeaders(headersToText(upstream.custom_headers));
   }, [
     upstream.base_url,
     upstream.custom_headers,
     upstream.vision_base_url,
     upstream.vision_model,
+    upstream.vision_use_proxy,
   ]);
   const save = async () => {
     let customHeaders: Record<string, string>;
@@ -979,6 +984,7 @@ function Models({
           vision_base_url: visionBase,
           vision_api_key: visionKey,
           vision_model: visionModel,
+          vision_use_proxy: visionUseProxy,
           custom_headers: customHeaders,
         }),
       });
@@ -1204,6 +1210,21 @@ function Models({
             />
           </label>
         </div>
+        <label className="vision-proxy-toggle">
+          <input
+            type="checkbox"
+            checked={visionUseProxy}
+            onChange={(e) => setVisionUseProxy(e.target.checked)}
+          />
+          <span>
+            <b>使用代理池</b>
+            <small>
+              {visionUseProxy
+                ? "图片辅助请求通过当前选中的代理发送。"
+                : "图片辅助请求直接连接供应商；主模型请求仍使用代理池。"}
+            </small>
+          </span>
+        </label>
         <p className="muted vision-helper-note">
           三项同时填写后启用。辅助请求不会使用 OpenCode 上游
           Key，也不会把图片内容写入使用记录；请点击上方“保存配置”生效。

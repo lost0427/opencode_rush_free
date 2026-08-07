@@ -435,6 +435,122 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	}
 }
 
+func TestVisionUseProxySettingAndDirectTransport(t *testing.T) {
+	a := testApp(t)
+
+	cfg, err := a.loadUpstream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.VisionUseProxy {
+		t.Fatal("vision proxy should be enabled when the setting is absent")
+	}
+
+	payload := []byte(`{"base_url":"https://upstream.example.test","vision_base_url":"https://vision.example.test","vision_model":"vision-model","vision_use_proxy":false}`)
+	put := httptest.NewRecorder()
+	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", bytes.NewReader(payload)))
+	if put.Code != http.StatusOK {
+		t.Fatalf("upstream config failed: %d body=%s", put.Code, put.Body.String())
+	}
+	cfg, err = a.loadUpstream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VisionUseProxy {
+		t.Fatal("explicitly disabled vision proxy was not persisted")
+	}
+
+	get := httptest.NewRecorder()
+	a.getUpstream(get, httptest.NewRequest(http.MethodGet, "/api/settings/upstream", nil))
+	var response struct {
+		VisionUseProxy bool `json:"vision_use_proxy"`
+	}
+	if err := json.NewDecoder(get.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.VisionUseProxy {
+		t.Fatal("upstream API returned an enabled vision proxy after it was disabled")
+	}
+
+	// A legacy client that omits the new field must preserve the saved value.
+	legacyPut := httptest.NewRecorder()
+	a.putUpstream(legacyPut, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", bytes.NewReader([]byte(`{"base_url":"https://upstream.example.test"}`))))
+	if legacyPut.Code != http.StatusOK {
+		t.Fatalf("legacy upstream update failed: %d body=%s", legacyPut.Code, legacyPut.Body.String())
+	}
+	cfg, err = a.loadUpstream()
+	if err != nil || cfg.VisionUseProxy {
+		t.Fatalf("legacy update changed vision proxy setting: %#v err=%v", cfg, err)
+	}
+
+	client, err := a.httpClient(ProxyRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatal("empty proxy record did not configure a direct transport")
+	}
+}
+
+func TestVisionDirectRequestDoesNotPenalizeChatProxy(t *testing.T) {
+	a := testApp(t)
+	visionHits := 0
+	vision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		visionHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"vision unavailable"}`))
+	}))
+	defer vision.Close()
+
+	payload := []byte(`{"base_url":"http://gateway-upstream.example.test","vision_base_url":"` + vision.URL + `","vision_model":"vision-model","vision_use_proxy":false}`)
+	put := httptest.NewRecorder()
+	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", bytes.NewReader(payload)))
+	if put.Code != http.StatusOK {
+		t.Fatalf("upstream config failed: %d body=%s", put.Code, put.Body.String())
+	}
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "text-model:free", "Text model", 1, "test", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	p, err := parseProxy("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyID, err := a.insertProxy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('client_key',?)", hashToken("test-client")); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"model":"text-model:free","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"https://image.example/test.png"}}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-client")
+	response := httptest.NewRecorder()
+	a.gatewayChat(response, req)
+	if response.Code != http.StatusBadGateway || visionHits != 1 {
+		t.Fatalf("expected one direct helper request and a gateway error, status=%d hits=%d body=%s", response.Code, visionHits, response.Body.String())
+	}
+
+	var failureCount int
+	if err := a.db.QueryRow("SELECT failure_count FROM proxies WHERE id=?", proxyID).Scan(&failureCount); err != nil {
+		t.Fatal(err)
+	}
+	if failureCount != 0 {
+		t.Fatalf("direct vision failure penalized the chat proxy: %d", failureCount)
+	}
+	var helperProxyID sql.NullInt64
+	var helperProxyURI, helperStatus string
+	if err := a.db.QueryRow("SELECT proxy_id,proxy_uri,status FROM usage_requests WHERE request_kind='vision_helper' ORDER BY id DESC LIMIT 1").Scan(&helperProxyID, &helperProxyURI, &helperStatus); err != nil {
+		t.Fatal(err)
+	}
+	if helperProxyID.Valid || helperProxyURI != "" || helperStatus != "error" {
+		t.Fatalf("direct helper usage was not recorded as direct: id=%#v uri=%q status=%q", helperProxyID, helperProxyURI, helperStatus)
+	}
+}
+
 func TestCustomHeaderValidation(t *testing.T) {
 	if _, err := validateCustomHeaders(map[string]string{"Authorization": "Bearer override"}); err == nil {
 		t.Fatal("authorization override was accepted")
