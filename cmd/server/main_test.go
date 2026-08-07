@@ -1,0 +1,701 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+func testApp(t *testing.T) *App {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:test-"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	h := sha256.Sum256([]byte("test-encryption-key"))
+	a := &App{
+		db:            db,
+		key:           h[:],
+		session:       "test-session-secret-that-is-long-enough",
+		admin:         "test-password",
+		loginAttempts: make(map[string]loginAttempt),
+		gatewaySem:    make(chan struct{}, 10),
+	}
+	if err := a.ensureAdmin(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureClientKey(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return a
+}
+
+func TestProxyParserSanitizesCredentials(t *testing.T) {
+	p, err := parseProxy("socks5://alice:s3cret@127.0.0.1:1080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Password != "s3cret" || p.Username != "alice" {
+		t.Fatalf("credentials not parsed: %#v", p)
+	}
+	if strings.Contains(p.URI, "s3cret") {
+		t.Fatalf("password leaked in URI: %s", p.URI)
+	}
+}
+
+func TestFreeClassificationAndUsageParsing(t *testing.T) {
+	if ok, reason := classifyFree("model:free", map[string]any{}); !ok || reason != "id_suffix" {
+		t.Fatalf("suffix classification: %v %s", ok, reason)
+	}
+	if ok, reason := classifyFree("model-free", map[string]any{}); !ok || reason != "id_suffix" {
+		t.Fatalf("dash suffix classification: %v %s", ok, reason)
+	}
+	if ok, reason := classifyFree("model", map[string]any{"pricing": map[string]any{"prompt": "0", "completion": "0"}}); !ok || reason != "pricing_zero" {
+		t.Fatalf("pricing classification: %v %s", ok, reason)
+	}
+	if ok, _ := classifyFree("paid", map[string]any{"pricing": map[string]any{"prompt": "0.1", "completion": "0"}}); ok {
+		t.Fatal("paid model classified as free")
+	}
+	u := parseUsageBytes([]byte(`{"usage":{"prompt_tokens":2,"completion_tokens":5,"total_tokens":7}}`))
+	if u == nil || *u.Total != 7 {
+		t.Fatalf("usage parsing failed: %#v", u)
+	}
+}
+
+func TestImageInputDetectionAndModelCapabilities(t *testing.T) {
+	textOnly := []byte(`{"architecture":{"input_modalities":["text"],"modality":"text->text"}}`)
+	if known, supports := modelImageSupport(textOnly); !known || supports {
+		t.Fatalf("text-only model capability was not detected: known=%v supports=%v", known, supports)
+	}
+	vision := []byte(`{"architecture":{"input_modalities":["text","image"],"modality":"text+image->text"}}`)
+	if known, supports := modelImageSupport(vision); !known || !supports {
+		t.Fatalf("vision model capability was not detected: known=%v supports=%v", known, supports)
+	}
+	if !requestHasImageInput([]byte(`{"model":"alpha:free","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}]}]}`)) {
+		t.Fatal("image_url content was not detected")
+	}
+	if requestHasImageInput([]byte(`{"model":"alpha:free","messages":[{"role":"user","content":"plain text"}]}`)) {
+		t.Fatal("plain text was incorrectly detected as image input")
+	}
+}
+
+func TestVisionBridgeTransformsImageContent(t *testing.T) {
+	original := []byte(`{"model":"text-model:free","messages":[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"https://example.test/image.png"}}]}],"stream":true}`)
+	helperBody, err := buildVisionRequest(original, "vision-provider/model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var helper map[string]any
+	if err := json.Unmarshal(helperBody, &helper); err != nil {
+		t.Fatal(err)
+	}
+	if helper["model"] != "vision-provider/model" || helper["stream"] != false {
+		t.Fatalf("helper request was not normalized: %#v", helper)
+	}
+	description, err := extractVisionDescription([]byte(`{"choices":[{"message":{"content":"a red square"}},],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
+	if err == nil {
+		// The malformed trailing comma must be rejected rather than silently dropping the helper response.
+		t.Fatal("malformed helper response was accepted")
+	}
+	description, err = extractVisionDescription([]byte(`{"choices":[{"message":{"content":"a red square"}}],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
+	if err != nil || description != "a red square" {
+		t.Fatalf("vision description was not extracted: %q %v", description, err)
+	}
+	description, err = extractVisionDescription([]byte(`{"choices":[{"message":{"content":"","reasoning_content":"a blue circle"}}]}`))
+	if err != nil || description != "a blue circle" {
+		t.Fatalf("reasoning fallback was not extracted: %q %v", description, err)
+	}
+	description = "a red square"
+	rewritten, err := replaceImageContent(original, description)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestHasImageInput(rewritten) || !strings.Contains(string(rewritten), "a red square") || !strings.Contains(string(rewritten), "What is this?") {
+		t.Fatalf("image content was not safely rewritten: %s", rewritten)
+	}
+}
+
+func TestVisionRequestContextSurvivesClientCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(parent)
+	cancelParent()
+	ctx, cancel := visionRequestContext(r)
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		t.Fatal("vision helper inherited the canceled client context")
+	default:
+	}
+}
+
+func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
+	a := testApp(t)
+	var modelHeaders, chatHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			modelHeaders = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"alpha:free"}]}`))
+		case "/v1/chat/completions":
+			chatHeaders = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	payload, _ := json.Marshal(map[string]any{
+		"base_url":        upstream.URL,
+		"api_key":         "up-secret",
+		"vision_base_url": upstream.URL,
+		"vision_api_key":  "vision-secret",
+		"vision_model":    "vision-model",
+		"custom_headers": map[string]string{
+			"User-Agent":        "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
+			"x-opencode-client": "cli",
+			"X-Relay-Test":      "enabled",
+		},
+	})
+	put := httptest.NewRecorder()
+	a.putUpstream(put, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", bytes.NewReader(payload)))
+	if put.Code != http.StatusOK {
+		t.Fatalf("upstream config failed: %d body=%s", put.Code, put.Body.String())
+	}
+
+	refresh := httptest.NewRecorder()
+	a.refreshModels(refresh, httptest.NewRequest(http.MethodPost, "/api/settings/models/refresh", nil))
+	if refresh.Code != http.StatusOK {
+		t.Fatalf("model refresh failed: %d body=%s", refresh.Code, refresh.Body.String())
+	}
+	if modelHeaders.Get("User-Agent") != "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13" || modelHeaders.Get("X-Opencode-Client") != "cli" || modelHeaders.Get("X-Relay-Test") != "enabled" {
+		t.Fatalf("custom model headers were not forwarded: %#v", modelHeaders)
+	}
+	if modelHeaders.Get("Authorization") != "Bearer up-secret" {
+		t.Fatalf("upstream authorization was not injected: %#v", modelHeaders)
+	}
+
+	cfg, err := a.loadUpstream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VisionBaseURL != upstream.URL || cfg.VisionAPIKey != "vision-secret" || cfg.VisionModel != "vision-model" {
+		t.Fatalf("vision supplier configuration was not isolated: %#v", cfg)
+	}
+	resp, err := a.forward(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if chatHeaders.Get("User-Agent") != "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13" || chatHeaders.Get("X-Opencode-Client") != "cli" || chatHeaders.Get("X-Relay-Test") != "enabled" {
+		t.Fatalf("custom chat headers were not forwarded: %#v", chatHeaders)
+	}
+	if chatHeaders.Get("Authorization") != "Bearer up-secret" || chatHeaders.Get("Content-Type") != "application/json" {
+		t.Fatalf("gateway-managed headers were not injected: %#v", chatHeaders)
+	}
+}
+
+func TestCustomHeaderValidation(t *testing.T) {
+	if _, err := validateCustomHeaders(map[string]string{"Authorization": "Bearer override"}); err == nil {
+		t.Fatal("authorization override was accepted")
+	}
+	if _, err := validateCustomHeaders(map[string]string{"X-Test\r\nInjected": "value"}); err == nil {
+		t.Fatal("invalid header name was accepted")
+	}
+	if _, err := validateCustomHeaders(map[string]string{"X-Test": "line1\r\nline2"}); err == nil {
+		t.Fatal("invalid header value was accepted")
+	}
+}
+
+func TestProxyExpiryAndBulkDelete(t *testing.T) {
+	a := testApp(t)
+	p1, err := parseProxy("http://127.0.0.1:3128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1.ExpiresAt = func() *time.Time { t := time.Now().UTC().Add(24 * time.Hour); return &t }()
+	id1, err := a.insertProxy(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := parseProxy("http://127.0.0.2:3128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := a.insertProxy(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, err := parseProxy("http://127.0.0.3:3128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().UTC().Add(-time.Hour)
+	expired.ExpiresAt = &past
+	if _, err = a.insertProxy(expired); err != nil {
+		t.Fatal(err)
+	}
+
+	list := httptest.NewRecorder()
+	a.listProxies(list, httptest.NewRequest(http.MethodGet, "/api/proxies", nil))
+	var proxies []ProxyRecord
+	if err := json.NewDecoder(list.Body).Decode(&proxies); err != nil {
+		t.Fatal(err)
+	}
+	if len(proxies) != 2 {
+		t.Fatalf("expired proxy was not removed: %#v", proxies)
+	}
+	var foundExpiry bool
+	for _, proxy := range proxies {
+		if proxy.ID == id1 {
+			foundExpiry = proxy.ExpiresAt != nil
+		}
+	}
+	if !foundExpiry {
+		t.Fatal("proxy expiry was not returned")
+	}
+
+	bulk := httptest.NewRecorder()
+	a.bulkDeleteProxies(bulk, httptest.NewRequest(http.MethodPost, "/api/proxies/bulk-delete", strings.NewReader(`{"ids":[`+strconv.FormatInt(id1, 10)+`,`+strconv.FormatInt(id2, 10)+`]}`)))
+	if bulk.Code != http.StatusOK || !strings.Contains(bulk.Body.String(), `"deleted":2`) {
+		t.Fatalf("bulk delete failed: status=%d body=%s", bulk.Code, bulk.Body.String())
+	}
+}
+
+func TestListProxiesPagination(t *testing.T) {
+	a := testApp(t)
+	for i := 1; i <= 5; i++ {
+		p, err := parseProxy("http://127.0.1." + strconv.Itoa(i) + ":3128")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.insertProxy(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page := httptest.NewRecorder()
+	a.listProxies(page, httptest.NewRequest(http.MethodGet, "/api/proxies?page=2&page_size=2", nil))
+	if page.Code != http.StatusOK {
+		t.Fatalf("expected paginated list to succeed, got %d: %s", page.Code, page.Body.String())
+	}
+	var response struct {
+		Items      []ProxyRecord `json:"items"`
+		Page       int           `json:"page"`
+		PageSize   int           `json:"page_size"`
+		Total      int           `json:"total"`
+		TotalPages int           `json:"total_pages"`
+	}
+	if err := json.NewDecoder(page.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Page != 2 || response.PageSize != 2 || response.Total != 5 || response.TotalPages != 3 || len(response.Items) != 2 {
+		t.Fatalf("unexpected page response: %#v", response)
+	}
+
+	last := httptest.NewRecorder()
+	a.listProxies(last, httptest.NewRequest(http.MethodGet, "/api/proxies?page=99&page_size=2", nil))
+	var lastPage struct {
+		Page  int           `json:"page"`
+		Items []ProxyRecord `json:"items"`
+	}
+	if err := json.NewDecoder(last.Body).Decode(&lastPage); err != nil {
+		t.Fatal(err)
+	}
+	if lastPage.Page != 3 || len(lastPage.Items) != 1 {
+		t.Fatalf("expected out-of-range page to clamp to last page, got %#v", lastPage)
+	}
+
+	invalid := httptest.NewRecorder()
+	a.listProxies(invalid, httptest.NewRequest(http.MethodGet, "/api/proxies?page=0&page_size=2", nil))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid page to fail, got %d: %s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestAdminImportRefreshAndGatewayModels(t *testing.T) {
+	a := testApp(t)
+	mux := http.NewServeMux()
+	a.routes(mux)
+	server := httptest.NewServer(a.withMiddleware(mux))
+	defer server.Close()
+
+	client := &http.Client{}
+	loginBody := `{"password":"test-password"}`
+	loginReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/auth/login", strings.NewReader(loginBody))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginResp, err := client.Do(loginReq)
+	if err != nil || loginResp.StatusCode != 200 {
+		t.Fatalf("login failed: %v status=%d", err, loginResp.StatusCode)
+	}
+	cookie := loginResp.Cookies()[0]
+	request := func(method, path, body string) *http.Response {
+		req, _ := http.NewRequest(method, server.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(cookie)
+		resp, e := client.Do(req)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return resp
+	}
+	imp := request(http.MethodPost, "/api/proxies/import", `{"text":"http://127.0.0.1:3128\nsocks5://u:p@127.0.0.2:1080\ninvalid"}`)
+	if imp.StatusCode != 200 {
+		t.Fatalf("import failed: %d", imp.StatusCode)
+	}
+	var imported struct {
+		Results []struct {
+			Status string `json:"status"`
+		} `json:"results"`
+	}
+	_ = json.NewDecoder(imp.Body).Decode(&imported)
+	if len(imported.Results) != 3 {
+		t.Fatalf("unexpected import results: %#v", imported)
+	}
+	proxyList := request(http.MethodGet, "/api/proxies", "")
+	var listed []ProxyRecord
+	_ = json.NewDecoder(proxyList.Body).Decode(&listed)
+	if len(listed) != 2 {
+		t.Fatalf("proxy list did not return imported rows: status=%d rows=%#v", proxyList.StatusCode, listed)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"alpha:free","pricing":{"prompt":"0","completion":"0"}},{"id":"paid","pricing":{"prompt":"0.01","completion":"0.01"}}]}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	put := request(http.MethodPut, "/api/settings/upstream", `{"base_url":"`+upstream.URL+`","api_key":"up-secret"}`)
+	if put.StatusCode != 200 {
+		t.Fatalf("upstream config failed: %d", put.StatusCode)
+	}
+	refresh := request(http.MethodPost, "/api/settings/models/refresh", "{}")
+	if refresh.StatusCode != 200 {
+		t.Fatalf("refresh failed: %d", refresh.StatusCode)
+	}
+	free := request(http.MethodGet, "/api/models/free", "")
+	var freeModels []ModelRecord
+	_ = json.NewDecoder(free.Body).Decode(&freeModels)
+	if len(freeModels) != 1 || freeModels[0].ModelID != "alpha:free" {
+		t.Fatalf("free filter failed: %#v", freeModels)
+	}
+	rotate := request(http.MethodPost, "/api/settings/client-key/rotate", "{}")
+	var key struct {
+		ClientKey string `json:"client_key"`
+	}
+	_ = json.NewDecoder(rotate.Body).Decode(&key)
+	if !strings.HasPrefix(key.ClientKey, "ocp-") || strings.Contains(key.ClientKey, "_") {
+		t.Fatalf("invalid client key: %q", key.ClientKey)
+	}
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+key.ClientKey)
+	gw, err := client.Do(req)
+	if err != nil || gw.StatusCode != 200 {
+		t.Fatalf("gateway models failed: %v status=%d", err, gw.StatusCode)
+	}
+	var payload struct {
+		Data []map[string]any `json:"data"`
+	}
+	_ = json.NewDecoder(gw.Body).Decode(&payload)
+	if len(payload.Data) != 1 {
+		t.Fatalf("gateway returned non-free models: %#v", payload)
+	}
+	for _, headerName := range []string{"X-API-Key", "API-Key"} {
+		compatReq, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+		compatReq.Header.Set(headerName, key.ClientKey)
+		compatResp, compatErr := client.Do(compatReq)
+		if compatErr != nil || compatResp.StatusCode != http.StatusOK {
+			t.Fatalf("gateway %s authentication failed: %v status=%d", headerName, compatErr, compatResp.StatusCode)
+		}
+		_ = compatResp.Body.Close()
+	}
+}
+
+func TestNormalizeAPIKey(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{" sk-test ", "sk-test"},
+		{"Bearer sk-test", "sk-test"},
+		{"bearer   sk-test", "sk-test"},
+		{"'sk-test'", "sk-test"},
+	} {
+		if got := normalizeAPIKey(tc.in); got != tc.want {
+			t.Fatalf("normalizeAPIKey(%q)=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestUpstreamErrorSummary(t *testing.T) {
+	got := upstreamErrorSummary([]byte(`{"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}`))
+	if got != "Invalid API key." {
+		t.Fatalf("unexpected summary: %q", got)
+	}
+}
+
+func TestSessionProxyAffinityAndQuotaAdvance(t *testing.T) {
+	a := testApp(t)
+	if _, err := a.db.Exec("INSERT INTO settings(key,value) VALUES('session_proxy_request_limit','2')"); err != nil {
+		t.Fatal(err)
+	}
+	proxies := []ProxyRecord{{ID: 101, URI: "http://127.0.0.1:3128"}, {ID: 202, URI: "http://127.0.0.2:3128"}}
+	session := "session-hash"
+
+	first, ok, err := a.pickSessionProxy(session, proxies, nil)
+	if err != nil || !ok {
+		t.Fatal("expected a proxy")
+	}
+	same, ok, err := a.pickSessionProxy(session, proxies, nil)
+	if err != nil || !ok || same.ID != first.ID {
+		t.Fatalf("session did not stay on its proxy: first=%d got=%d", first.ID, same.ID)
+	}
+	next, ok, err := a.pickSessionProxy(session, proxies, nil)
+	if err != nil || !ok || next.ID == first.ID {
+		t.Fatalf("quota did not advance the session: first=%d got=%d", first.ID, next.ID)
+	}
+
+	a.clearSessionProxy(session, next.ID)
+	again, ok, err := a.pickSessionProxy(session, proxies, map[int64]struct{}{first.ID: {}})
+	if err != nil || !ok || again.ID != next.ID {
+		t.Fatalf("cleared binding did not select the next eligible proxy: want=%d got=%d", next.ID, again.ID)
+	}
+}
+
+func TestSessionKeyUsesHeaderThenUser(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("Authorization", "Bearer client-one")
+	r.Header.Set("X-Relay-Session-ID", "conversation-one")
+	fromHeader := sessionKey(r, json.RawMessage(`"ignored-user"`))
+	if fromHeader != sessionKey(r, json.RawMessage(`"different-user"`)) {
+		t.Fatal("session header should take precedence")
+	}
+	r.Header.Del("X-Relay-Session-ID")
+	fromUser := sessionKey(r, json.RawMessage(`"conversation-one"`))
+	if fromHeader != fromUser {
+		t.Fatal("equivalent header and user session identifiers should match")
+	}
+	r.Header.Set("Authorization", "Bearer client-two")
+	if fromUser == sessionKey(r, json.RawMessage(`"conversation-one"`)) {
+		t.Fatal("sessions from different client keys must not share a route")
+	}
+}
+
+func TestPasswordChangeRejectsBcryptOverflowAndRevokesSessions(t *testing.T) {
+	a := testApp(t)
+	token := "ocp-test-admin-session"
+	if _, err := a.db.Exec("INSERT INTO settings(key,value) VALUES(?,?)", a.adminSessionKey(token), time.Now().Add(time.Hour).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+
+	overlong := httptest.NewRecorder()
+	a.changePassword(overlong, httptest.NewRequest(http.MethodPost, "/api/auth/password", strings.NewReader(`{"current":"test-password","new":"`+strings.Repeat("x", 73)+`"}`)))
+	if overlong.Code != http.StatusBadRequest {
+		t.Fatalf("expected overlong password rejection, got %d: %s", overlong.Code, overlong.Body.String())
+	}
+	var hash string
+	if err := a.db.QueryRow("SELECT value FROM settings WHERE key='admin_hash'").Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("test-password")); err != nil {
+		t.Fatal("overlong password corrupted the existing hash")
+	}
+
+	changed := httptest.NewRecorder()
+	a.changePassword(changed, httptest.NewRequest(http.MethodPost, "/api/auth/password", strings.NewReader(`{"current":"test-password","new":"replacement-password"}`)))
+	if changed.Code != http.StatusOK {
+		t.Fatalf("password change failed: %d %s", changed.Code, changed.Body.String())
+	}
+	if err := a.db.QueryRow("SELECT value FROM settings WHERE key=?", a.adminSessionKey(token)).Scan(&hash); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("existing session was not revoked: %v", err)
+	}
+	if err := a.db.QueryRow("SELECT value FROM settings WHERE key='admin_hash'").Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("replacement-password")); err != nil {
+		t.Fatal("new password was not stored")
+	}
+}
+
+func TestLogoutRevokesServerSession(t *testing.T) {
+	a := testApp(t)
+	token := "ocp-test-logout-session"
+	key := a.adminSessionKey(token)
+	if _, err := a.db.Exec("INSERT INTO settings(key,value) VALUES(?,?)", key, time.Now().Add(time.Hour).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "ocp_session", Value: token})
+	recorder := httptest.NewRecorder()
+	a.logout(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("logout failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var value string
+	if err := a.db.QueryRow("SELECT value FROM settings WHERE key=?", key).Scan(&value); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("server session still exists: %v", err)
+	}
+}
+
+func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
+	a := testApp(t)
+	payload := bytes.Repeat([]byte("a"), 3<<20)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":   []string{"application/octet-stream"},
+			"Content-Length": []string{strconv.Itoa(len(payload))},
+			"Set-Cookie":     []string{"ocp_session=attacker"},
+			"Connection":     []string{"X-Hop"},
+			"X-Hop":          []string{"remove-me"},
+			"X-Upstream":     []string{"keep-me"},
+		},
+		Body: io.NopCloser(bytes.NewReader(payload)),
+	}
+	recorder := httptest.NewRecorder()
+	_, _, copyErr := a.copyResponse(recorder, resp)
+	if copyErr != nil {
+		t.Fatal(copyErr)
+	}
+	if recorder.Body.Len() != len(payload) {
+		t.Fatalf("response was truncated: got=%d want=%d", recorder.Body.Len(), len(payload))
+	}
+	if recorder.Header().Get("Set-Cookie") != "" || recorder.Header().Get("Content-Length") != "" || recorder.Header().Get("X-Hop") != "" {
+		t.Fatalf("unsafe upstream headers were forwarded: %#v", recorder.Header())
+	}
+	if recorder.Header().Get("X-Upstream") != "keep-me" {
+		t.Fatal("safe upstream header was removed")
+	}
+}
+
+func TestProxyImportRedactsPassword(t *testing.T) {
+	a := testApp(t)
+	recorder := httptest.NewRecorder()
+	a.importProxies(recorder, httptest.NewRequest(http.MethodPost, "/api/proxies/import", strings.NewReader(`{"text":"http://alice:secret@127.0.0.1:3128"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("import failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "secret") {
+		t.Fatalf("proxy password leaked in import response: %s", recorder.Body.String())
+	}
+}
+
+func TestUsageKeepsProxySnapshotAfterDeletion(t *testing.T) {
+	a := testApp(t)
+	p, err := parseProxy("http://127.0.0.9:3128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.insertProxy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.recordUsage("model:free", &id, p.URI, "success", 200, time.Millisecond, 0, nil, nil)
+	if _, err := a.db.Exec("DELETE FROM proxies WHERE id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	a.usageList(recorder, httptest.NewRequest(http.MethodGet, "/api/usage/requests", nil))
+	var rows []usageRequest
+	if err := json.NewDecoder(recorder.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ProxyURI != p.URI {
+		t.Fatalf("proxy snapshot was lost: %#v", rows)
+	}
+}
+
+func TestPatchMissingProxyReturnsNotFound(t *testing.T) {
+	a := testApp(t)
+	req := httptest.NewRequest(http.MethodPatch, "/api/proxies/999", strings.NewReader(`{"enabled":false}`))
+	req.SetPathValue("id", "999")
+	recorder := httptest.NewRecorder()
+	a.patchProxy(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRequestsWithoutSessionIDRoundRobin(t *testing.T) {
+	a := testApp(t)
+	proxies := []ProxyRecord{{ID: 1}, {ID: 2}}
+	first, ok, err := a.pickSessionProxy("", proxies, nil)
+	if err != nil || !ok {
+		t.Fatalf("first selection failed: %v", err)
+	}
+	second, ok, err := a.pickSessionProxy("", proxies, nil)
+	if err != nil || !ok {
+		t.Fatalf("second selection failed: %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("requests without a session ID shared one route: %d", first.ID)
+	}
+}
+
+func TestEncryptionKeyRotationIsRepeatable(t *testing.T) {
+	a := testApp(t)
+	previousKey := append([]byte(nil), a.key...)
+	p, err := parseProxy("http://alice:secret@127.0.0.10:3128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.insertProxy(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKey, err := a.encrypt("upstream-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('upstream_api_key',?)", apiKey); err != nil {
+		t.Fatal(err)
+	}
+	newHash := sha256.Sum256([]byte("replacement-encryption-key-that-is-long-enough"))
+	a.key = newHash[:]
+	migrated, err := a.rotateEncryptionKey(previousKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated != 2 {
+		t.Fatalf("expected two encrypted values to migrate, got %d", migrated)
+	}
+	var encryptedPassword string
+	if err = a.db.QueryRow("SELECT encrypted_password FROM proxies WHERE id=?", id).Scan(&encryptedPassword); err != nil {
+		t.Fatal(err)
+	}
+	if password, err := a.decrypt(encryptedPassword); err != nil || password != "secret" {
+		t.Fatalf("rotated proxy password is invalid: password=%q err=%v", password, err)
+	}
+	var encryptedAPIKey string
+	if err = a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_api_key'").Scan(&encryptedAPIKey); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := a.decrypt(encryptedAPIKey); err != nil || value != "upstream-secret" {
+		t.Fatalf("rotated API key is invalid: value=%q err=%v", value, err)
+	}
+	migrated, err = a.rotateEncryptionKey(previousKey)
+	if err != nil || migrated != 0 {
+		t.Fatalf("repeat rotation should be a no-op: migrated=%d err=%v", migrated, err)
+	}
+}

@@ -1,0 +1,8 @@
+.env
+*.db
+*.db-*
+opencode-proxy-linux
+opencode-proxy-linux-amd64
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
