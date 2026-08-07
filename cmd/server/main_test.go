@@ -145,6 +145,24 @@ func TestVisionRequestContextSurvivesClientCancellation(t *testing.T) {
 	}
 }
 
+func TestUsageRecordsDistinguishVisionHelper(t *testing.T) {
+	a := testApp(t)
+	prompt, completion, total := int64(4), int64(6), int64(10)
+	a.recordUsageKind("vision_helper", "vision-provider/model", nil, "", "success", http.StatusOK, 120*time.Millisecond, 0, &tokenUsage{Prompt: &prompt, Completion: &completion, Total: &total}, nil)
+	list := httptest.NewRecorder()
+	a.usageList(list, httptest.NewRequest(http.MethodGet, "/api/usage/requests?limit=10", nil))
+	if list.Code != http.StatusOK {
+		t.Fatalf("usage list failed: %d: %s", list.Code, list.Body.String())
+	}
+	var rows []usageRequest
+	if err := json.NewDecoder(list.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].RequestKind != "vision_helper" || rows[0].Model != "vision-provider/model" || rows[0].TotalTokens == nil || *rows[0].TotalTokens != 10 {
+		t.Fatalf("vision helper usage was not recorded separately: %#v", rows)
+	}
+}
+
 func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	a := testApp(t)
 	var modelHeaders, chatHeaders http.Header

@@ -65,6 +65,7 @@ type Model = {
 type RequestRow = {
   id: number;
   created_at: string;
+  request_kind?: string;
   model: string;
   proxy_uri?: string;
   status: string;
@@ -1313,7 +1314,12 @@ function Usage({ rows }: { rows: RequestRow[] }) {
           {shown.map((r) => (
             <div className="table-row" key={r.id}>
               <div>
-                <b>{r.model}</b>
+                <div className="request-model-line">
+                  <b>{r.model}</b>
+                  {r.request_kind === "vision_helper" && (
+                    <span className="helper-tag">图片辅助</span>
+                  )}
+                </div>
                 <small>{new Date(r.created_at).toLocaleString()}</small>
               </div>
               <span

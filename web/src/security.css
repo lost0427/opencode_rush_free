@@ -166,6 +166,23 @@
   width: 30px;
   height: 30px;
 }
+.request-model-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.helper-tag {
+  flex: none;
+  font:
+    9px "DM Mono",
+    monospace;
+  letter-spacing: 0.04em;
+  color: #5f7a68;
+  background: #dfe9e1;
+  padding: 3px 5px;
+  border-radius: 2px;
+}
 @media (max-width: 580px) {
   .password-grid {
     grid-template-columns: 1fr;
