@@ -4,6 +4,15 @@
   gap: 12px;
   align-items: end;
 }
+.stat-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.usage-page-intro,
+.daily-usage-panel,
+.usage-page-intro + .panel,
+.usage-page-intro ~ .panel {
+  min-width: 0;
+}
 .password-grid label {
   margin: 0;
 }
@@ -94,6 +103,30 @@
   align-items: center;
   gap: 12px;
 }
+.proxy-state-filter {
+  display: flex !important;
+  align-items: center;
+  gap: 7px;
+  margin: 0 !important;
+  color: #656a62 !important;
+  font-size: 11px !important;
+  white-space: nowrap;
+}
+.proxy-state-filter select,
+.retention-controls select {
+  min-height: 34px;
+  color: var(--ink);
+  background: #fffdf8;
+  border: 1px solid #d8d4ca;
+  border-radius: 2px;
+  padding: 7px 9px;
+  font: 11px Manrope, sans-serif;
+}
+.proxy-state-filter select:disabled,
+.retention-controls select:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
 .select-all {
   display: flex;
   align-items: center;
@@ -140,6 +173,18 @@
 }
 .data-table.is-loading .table-row {
   opacity: 0.58;
+}
+.health.in-use {
+  color: #486f9b;
+}
+.health.in-use i {
+  background: #5d78a4;
+}
+.health.disabled {
+  color: #858980;
+}
+.health.disabled i {
+  background: #a3a69e;
 }
 .proxy-pagination {
   display: flex;
@@ -236,10 +281,14 @@
 }
 
 .usage-rate-rail {
-  min-width: 430px;
+  width: min(100%, 480px);
+  min-width: 0;
   min-height: 78px;
   display: grid;
-  grid-template-columns: minmax(210px, 1fr) 96px 112px;
+  grid-template-columns: minmax(170px, 1fr) minmax(128px, max-content);
+  grid-template-areas:
+    "context rpm"
+    "context tpm";
   align-items: stretch;
   color: #f7f3ea;
   background: #2f342f;
@@ -252,6 +301,7 @@
   align-items: center;
 }
 .usage-rate-context {
+  grid-area: context;
   gap: 10px;
   padding: 14px 17px;
   color: #9fc1aa;
@@ -277,6 +327,14 @@
   justify-content: center;
   gap: 5px;
   border-left: 1px solid #464c46;
+  padding: 0 16px;
+}
+.usage-rate-value:nth-child(2) {
+  grid-area: rpm;
+}
+.usage-rate-value:nth-child(3) {
+  grid-area: tpm;
+  border-top: 1px solid #464c46;
 }
 .usage-rate-value span {
   color: #9ea59c;
@@ -285,16 +343,56 @@
     monospace;
 }
 .usage-rate-value strong {
-  max-width: 100%;
   color: #fffdf8;
   font:
-    700 22px "DM Mono",
+    700 20px "DM Mono",
     monospace;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .usage-rate-value:last-child strong {
   color: #e7b29f;
+}
+.daily-usage-scroll {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-color: #c5c1b7 transparent;
+}
+.daily-usage-table {
+  min-width: 420px;
+}
+.daily-usage-head,
+.daily-usage-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.1fr) minmax(100px, 0.7fr) minmax(140px, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+.daily-usage-head {
+  padding-bottom: 10px;
+  color: #95988f;
+  font: 10px "DM Mono", monospace;
+  letter-spacing: 0.07em;
+}
+.daily-usage-row {
+  min-height: 48px;
+  border-top: 1px solid var(--line);
+  color: #596059;
+  font: 11px "DM Mono", monospace;
+}
+.daily-usage-row strong {
+  color: #416b5a;
+}
+.retention-controls {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+}
+.retention-controls label {
+  width: min(100%, 240px);
+  margin: 0;
+}
+.retention-controls select {
+  width: 100%;
 }
 .usage-filters {
   display: grid;
@@ -395,6 +493,7 @@
   white-space: nowrap;
 }
 .usage-table-scroll {
+  min-width: 0;
   width: 100%;
   overflow-x: auto;
   scrollbar-color: #c5c1b7 transparent;
@@ -464,6 +563,9 @@
 }
 
 @media (max-width: 900px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
   .usage-page-intro {
     align-items: flex-start;
     flex-direction: column;
@@ -474,8 +576,23 @@
 @media (max-width: 760px) {
   .usage-rate-rail {
     width: 100%;
-    min-width: 0;
-    grid-template-columns: minmax(180px, 1fr) 82px 96px;
+    grid-template-columns: 1fr;
+    grid-template-areas: none;
+  }
+  .usage-rate-context {
+    grid-area: auto;
+    padding: 13px 15px;
+  }
+  .usage-rate-context small {
+    white-space: normal;
+  }
+  .usage-rate-value {
+    grid-area: auto !important;
+    min-height: 54px;
+    flex-direction: row;
+    justify-content: space-between;
+    border-top: 1px solid #464c46;
+    border-left: 0;
   }
   .usage-filters {
     grid-template-columns: 1fr;
@@ -502,23 +619,26 @@
 
 @media (max-width: 580px) {
   .usage-rate-rail {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr;
   }
   .usage-rate-context {
-    grid-column: 1 / -1;
     padding: 12px;
   }
   .usage-rate-context small {
-    max-width: 145px;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    max-width: none;
   }
   .usage-rate-value strong {
-    font-size: 18px;
+    font-size: 16px;
   }
   .usage-rate-value {
-    min-height: 58px;
-    border-top: 1px solid #464c46;
+    min-height: 52px;
+  }
+  .retention-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .retention-controls label {
+    width: 100%;
   }
   .time-segments {
     grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -1078,3 +1078,157 @@ func TestEncryptionKeyRotationIsRepeatable(t *testing.T) {
 		t.Fatalf("repeat rotation should be a no-op: migrated=%d err=%v", migrated, err)
 	}
 }
+
+func insertTokenUsageAt(t *testing.T, a *App, createdAt time.Time, status string, prompt, completion, total int64) {
+	t.Helper()
+	statusCode := http.StatusOK
+	if status == "error" {
+		statusCode = http.StatusBadGateway
+	}
+	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,status,status_code,latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)", createdAt.UTC().Format(time.RFC3339), "chat", "model:free", status, statusCode, 10, 0, prompt, completion, total); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStatsSummaryUsesChinaDayForTokens(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UTC()
+	insertTokenUsageAt(t, a, now, "success", 11, 7, 18)
+	insertTokenUsageAt(t, a, chinaDayStart(now).Add(-time.Second), "error", 101, 99, 200)
+
+	recorder := httptest.NewRecorder()
+	a.statsSummary(recorder, httptest.NewRequest(http.MethodGet, "/api/stats/summary", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var got struct {
+		Requests         int64   `json:"requests"`
+		Success          int64   `json:"success"`
+		SuccessRate      float64 `json:"success_rate"`
+		PromptTokens     int64   `json:"prompt_tokens"`
+		CompletionTokens int64   `json:"completion_tokens"`
+		TotalTokens      int64   `json:"total_tokens"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Requests != 2 || got.Success != 1 || got.SuccessRate != 0.5 {
+		t.Fatalf("historical request counters changed: %#v", got)
+	}
+	if got.PromptTokens != 11 || got.CompletionTokens != 7 || got.TotalTokens != 18 {
+		t.Fatalf("today token summary included the prior China day: %#v", got)
+	}
+}
+
+func TestStatsTimeseriesGroupsByChinaDate(t *testing.T) {
+	a := testApp(t)
+	insertTokenUsageAt(t, a, time.Date(2026, time.January, 1, 16, 30, 0, 0, time.UTC), "success", 2, 3, 5)
+
+	recorder := httptest.NewRecorder()
+	a.statsTimeseries(recorder, httptest.NewRequest(http.MethodGet, "/api/stats/timeseries", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("timeseries failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var rows []struct {
+		Day      string `json:"day"`
+		Requests int64  `json:"requests"`
+		Tokens   int64  `json:"tokens"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Day != "2026-01-02" || rows[0].Requests != 1 || rows[0].Tokens != 5 {
+		t.Fatalf("usage was not grouped by China date: %#v", rows)
+	}
+}
+
+func TestProxyStateFiltersAndUsageLabels(t *testing.T) {
+	a := testApp(t)
+	add := func(raw string) int64 {
+		p, err := parseProxy(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := a.insertProxy(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	unusedID := add("http://127.0.10.1:3128")
+	inUseID := add("http://127.0.10.2:3128")
+	cooldownID := add("http://127.0.10.3:3128")
+	now := time.Now().UTC()
+	if _, err := a.db.Exec("INSERT INTO session_proxy_routes(session_key,proxy_id,request_count,created_at,updated_at) VALUES(?,?,?,?,?)", "active-route", inUseID, 1, now.Format(time.RFC3339), now.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("INSERT INTO session_proxy_routes(session_key,proxy_id,request_count,created_at,updated_at) VALUES(?,?,?,?,?)", "cooldown-route", cooldownID, 1, now.Format(time.RFC3339), now.Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("UPDATE proxies SET cooldown_until=? WHERE id=?", now.Add(time.Hour).Format(time.RFC3339), cooldownID); err != nil {
+		t.Fatal(err)
+	}
+
+	list := func(state string) []ProxyRecord {
+		recorder := httptest.NewRecorder()
+		a.listProxies(recorder, httptest.NewRequest(http.MethodGet, "/api/proxies?page=1&page_size=50&state="+state, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("state %s failed: %d %s", state, recorder.Code, recorder.Body.String())
+		}
+		var response struct {
+			Items []ProxyRecord `json:"items"`
+		}
+		if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		return response.Items
+	}
+	if rows := list("unused"); len(rows) != 1 || rows[0].ID != unusedID || rows[0].UsageState != "unused" {
+		t.Fatalf("unexpected unused proxies: %#v", rows)
+	}
+	if rows := list("in_use"); len(rows) != 1 || rows[0].ID != inUseID || rows[0].UsageState != "in_use" {
+		t.Fatalf("unexpected in-use proxies: %#v", rows)
+	}
+	if rows := list("cooldown"); len(rows) != 1 || rows[0].ID != cooldownID || rows[0].UsageState != "cooldown" {
+		t.Fatalf("cooldown did not take precedence: %#v", rows)
+	}
+
+	invalid := httptest.NewRecorder()
+	a.listProxies(invalid, httptest.NewRequest(http.MethodGet, "/api/proxies?page=1&state=wrong", nil))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid proxy state succeeded: %d %s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestUsageRetentionSettingsDeleteExpiredRecords(t *testing.T) {
+	a := testApp(t)
+	if got := a.usageRetentionDays(); got != defaultUsageRetentionDays {
+		t.Fatalf("unexpected default retention: %d", got)
+	}
+	oldTokens := int64(10)
+	freshTokens := int64(20)
+	insertUsageAt(t, a, time.Now().AddDate(0, 0, -31), "old", "success", &oldTokens)
+	insertUsageAt(t, a, time.Now().AddDate(0, 0, -29), "fresh", "success", &freshTokens)
+
+	recorder := httptest.NewRecorder()
+	a.putUsageRetention(recorder, httptest.NewRequest(http.MethodPut, "/api/settings/usage-retention", strings.NewReader(`{"usage_retention_days":30}`)))
+	if recorder.Code != http.StatusOK || a.usageRetentionDays() != 30 {
+		t.Fatalf("retention update failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var count int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM usage_requests").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("expired records were not removed: count=%d err=%v", count, err)
+	}
+
+	invalid := httptest.NewRecorder()
+	a.putUsageRetention(invalid, httptest.NewRequest(http.MethodPut, "/api/settings/usage-retention", strings.NewReader(`{"usage_retention_days":14}`)))
+	if invalid.Code != http.StatusBadRequest || a.usageRetentionDays() != 30 {
+		t.Fatalf("invalid retention was accepted: %d %s", invalid.Code, invalid.Body.String())
+	}
+
+	get := httptest.NewRecorder()
+	a.getUsageRetention(get, httptest.NewRequest(http.MethodGet, "/api/settings/usage-retention", nil))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"usage_retention_days":30`) {
+		t.Fatalf("retention read failed: %d %s", get.Code, get.Body.String())
+	}
+}

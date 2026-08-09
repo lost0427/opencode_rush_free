@@ -47,6 +47,7 @@ type Proxy = {
   enabled: boolean;
   health_status: string;
   failure_count: number;
+  usage_state?: "unused" | "in_use" | "cooldown";
   cooldown_until?: string;
   expires_at?: string;
 };
@@ -95,6 +96,12 @@ type UsageRates = {
   tpm: number;
   measured_at: string;
 };
+type DailyUsage = {
+  day: string;
+  requests: number;
+  tokens: number;
+};
+type ProxyFilterState = "all" | "unused" | "in_use" | "cooldown";
 type UsageTimePreset = "all" | "1h" | "24h" | "7d" | "30d" | "custom";
 type UsageFilters = {
   time: UsageTimePreset;
@@ -280,6 +287,7 @@ function Console({
     ["proxies", "Proxy pool", "代理池", Network],
     ["models", "Free models", "模型与网关", Database],
     ["usage", "Usage log", "使用记录", Activity],
+    ["settings", "Settings", "设置", Settings2],
   ] as const;
   return (
     <div className="app-shell">
@@ -372,6 +380,9 @@ function Console({
             refreshToken={usageRefreshToken}
           />
         )}{" "}
+        {page === "settings" && (
+          <SettingsPage notify={notify} onLogout={onLogout} />
+        )}{" "}
         {toast && (
           <div className="toast">
             <Check size={15} />
@@ -421,11 +432,11 @@ function Overview({
     <div className="page">
       <section className="hero-band">
         <div>
-          <div className="eyebrow">LIVE RELAY TELEMETRY</div>
+          <div className="eyebrow">实时网关监控</div>
           <h1>
-            Requests move.
+            请求在流动。
             <br />
-            <em>Signals stay clear.</em>
+            <em>信号保持清晰。</em>
           </h1>
           <p>
             一个安静、可追踪的 Free 模型通道。代理池负责路径，控制台负责判断。
@@ -436,44 +447,50 @@ function Overview({
           <div className="orbit-ring r2" />
           <div className="orbit-core">
             <span className="pulse" />
-            LIVE
+            在线
           </div>
         </div>
       </section>
       <section className="stat-grid">
         <Stat
-          label="Total requests"
+          label="总请求数"
           value={fmt(summary.requests)}
-          detail={`${success.toFixed(1)}% success`}
+          detail="全历史累计"
           accent="#c9684a"
         />
         <Stat
-          label="Total tokens"
+          label="当日 Token"
           value={fmt(summary.total_tokens)}
-          detail={`${fmt(summary.prompt_tokens)} prompt · ${fmt(summary.completion_tokens)} completion`}
+          detail={`${fmt(summary.prompt_tokens)} 输入 · ${fmt(summary.completion_tokens)} 输出`}
           accent="#416b5a"
         />
         <Stat
-          label="Free models"
+          label="免费模型"
           value={fmt(summary.free_models)}
-          detail="available to gateway"
+          detail="网关可用"
           accent="#c49b3a"
         />
         <Stat
-          label="Active proxies"
+          label="可用代理"
           value={fmt(summary.active_proxies)}
-          detail="ready for rotation"
+          detail="参与轮换"
           accent="#5d78a4"
+        />
+        <Stat
+          label="成功率"
+          value={`${success.toFixed(1)}%`}
+          detail={`${fmt(summary.success)} / ${fmt(summary.requests)} 请求成功`}
+          accent="#6d8b75"
         />
       </section>
       <section className="two-col">
         <div className="panel">
           <div className="panel-head">
             <div>
-              <span className="eyebrow">ROUTING SURFACE</span>
-              <h3>Free models</h3>
+              <span className="eyebrow">路由概览</span>
+              <h3>免费模型</h3>
             </div>
-            <span className="count-chip">{models.length} online</span>
+            <span className="count-chip">{models.length} 个可用</span>
           </div>
           {models.length === 0 ? (
             <Empty text="还没有可用的 Free 模型" />
@@ -485,7 +502,7 @@ function Overview({
                   <div>
                     <b>{m.model_id}</b>
                     <small>
-                      {m.free_reason.replaceAll("_", " ")} · refreshed{" "}
+                      {m.free_reason.replaceAll("_", " ")} · 更新于{" "}
                       {new Date(m.refreshed_at).toLocaleDateString()}
                     </small>
                   </div>
@@ -498,10 +515,10 @@ function Overview({
         <div className="panel">
           <div className="panel-head">
             <div>
-              <span className="eyebrow">RECENT TRAFFIC</span>
-              <h3>Latest requests</h3>
+              <span className="eyebrow">最近流量</span>
+              <h3>最新请求</h3>
             </div>
-            <span className="count-chip">{rows.length} shown</span>
+            <span className="count-chip">显示 {rows.length} 条</span>
           </div>
           {rows.length === 0 ? (
             <Empty text="请求记录会出现在这里" />
@@ -552,6 +569,7 @@ function Proxies({
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<number[]>([]);
   const [busy, setBusy] = useState(false);
+  const [proxyState, setProxyState] = useState<ProxyFilterState>("all");
   const [sessionLimit, setSessionLimit] = useState(
     String(upstream.session_proxy_request_limit ?? 50),
   );
@@ -559,8 +577,13 @@ function Proxies({
     async (requestedPage: number, requestedPageSize: number) => {
       setLoading(true);
       try {
+        const params = new URLSearchParams({
+          page: String(requestedPage),
+          page_size: String(requestedPageSize),
+          state: proxyState,
+        });
         const data = (await api(
-          `/api/proxies?page=${requestedPage}&page_size=${requestedPageSize}`,
+          `/api/proxies?${params.toString()}`,
         )) as ProxyPage;
         setProxies(data.items);
         setProxyPage(data.page);
@@ -576,7 +599,7 @@ function Proxies({
         setLoading(false);
       }
     },
-    [notify],
+    [notify, proxyState],
   );
   useEffect(() => {
     void loadProxies(proxyPage, pageSize);
@@ -671,6 +694,14 @@ function Proxies({
     } finally {
       setBusy(false);
     }
+  };
+  const proxyStatus = (proxy: Proxy) => {
+    if (proxy.usage_state === "cooldown" || proxy.health_status === "cooldown")
+      return { label: "冷却中", className: "cooldown" };
+    if (proxy.usage_state === "in_use")
+      return { label: "使用中", className: "in-use" };
+    if (!proxy.enabled) return { label: "已禁用", className: "disabled" };
+    return { label: "就绪", className: "healthy" };
   };
   return (
     <div className="page">
@@ -790,6 +821,23 @@ function Proxies({
             <p className="muted">失败路径会短暂冷却；到期代理会自动删除。</p>
           </div>
           <div className="proxy-actions">
+            <label className="proxy-state-filter">
+              <span>筛选</span>
+              <select
+                value={proxyState}
+                disabled={loading || busy}
+                onChange={(event) => {
+                  setProxyState(event.target.value as ProxyFilterState);
+                  setProxyPage(1);
+                  setSelected([]);
+                }}
+              >
+                <option value="all">全部代理</option>
+                <option value="unused">未使用</option>
+                <option value="in_use">正在使用</option>
+                <option value="cooldown">冷却中</option>
+              </select>
+            </label>
             <label className="select-all">
               <input
                 type="checkbox"
@@ -809,7 +857,7 @@ function Proxies({
               <Trash2 size={14} />
               删除选中
             </button>
-            <span className="count-chip">{fmt(total)} paths</span>
+            <span className="count-chip">{fmt(total)} 条</span>
           </div>
         </div>
         <div className={`data-table ${loading ? "is-loading" : ""}`}>
@@ -819,7 +867,9 @@ function Proxies({
             <span>失败次数</span>
             <span>操作</span>
           </div>
-          {proxies.map((p) => (
+          {proxies.map((p) => {
+            const status = proxyStatus(p);
+            return (
             <div className="table-row" key={p.id}>
               <div className="proxy-uri-cell">
                 <input
@@ -839,13 +889,9 @@ function Proxies({
                   </small>
                 </div>
               </div>
-              <span className={`health ${p.health_status}`}>
+              <span className={`health ${status.className}`}>
                 <i />
-                {p.enabled
-                  ? p.health_status === "cooldown"
-                    ? "cooldown"
-                    : "ready"
-                  : "disabled"}
+                {status.label}
               </span>
               <span>{p.failure_count}</span>
               <div className="row-actions">
@@ -866,7 +912,8 @@ function Proxies({
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
           {loading && proxies.length === 0 && <Empty text="正在加载代理…" />}
           {!loading && proxies.length === 0 && (
             <Empty text="先导入第一条代理路径" />
@@ -1230,7 +1277,6 @@ function Models({
           Key，也不会把图片内容写入使用记录；请点击上方“保存配置”生效。
         </p>
       </section>
-      <PasswordCard notify={notify} />
       <section className="panel">
         <div className="panel-head">
           <div>
@@ -1295,7 +1341,7 @@ function PasswordCard({ notify }: { notify: (v: string) => void }) {
         <div>
           <span className="eyebrow">SECURITY</span>
           <h3>管理员密码</h3>
-          <p className="muted">修改后当前会话仍保持有效。</p>
+          <p className="muted">修改后会撤销所有控制台会话并要求重新登录。</p>
         </div>
         <KeyRound size={20} />
       </div>
@@ -1323,6 +1369,98 @@ function PasswordCard({ notify }: { notify: (v: string) => void }) {
         </button>
       </div>
     </section>
+  );
+}
+
+function SettingsPage({
+  notify,
+  onLogout,
+}: {
+  notify: (value: string) => void;
+  onLogout: () => void;
+}) {
+  const [retentionDays, setRetentionDays] = useState(90);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    api("/api/settings/usage-retention")
+      .then((data) => {
+        if (active) setRetentionDays(data.usage_retention_days);
+      })
+      .catch((error) => {
+        if ((error as Error).message === "AUTH") onLogout();
+        else notify((error as Error).message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [notify, onLogout]);
+
+  const saveRetention = async () => {
+    setSaving(true);
+    try {
+      const data = await api("/api/settings/usage-retention", {
+        method: "PUT",
+        body: JSON.stringify({ usage_retention_days: retentionDays }),
+      });
+      setRetentionDays(data.usage_retention_days);
+      notify("使用记录保留时间已保存");
+    } catch (error) {
+      if ((error as Error).message === "AUTH") onLogout();
+      else notify((error as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="page">
+      <div className="page-intro">
+        <div>
+          <div className="eyebrow">CONSOLE SETTINGS</div>
+          <h1>设置</h1>
+          <p>管理控制台访问和使用记录保留策略。</p>
+        </div>
+      </div>
+      <PasswordCard notify={notify} />
+      <section className="panel retention-panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">DATA RETENTION</span>
+            <h3>使用记录保留时间</h3>
+            <p className="muted">超过保留期限的请求记录会自动删除。</p>
+          </div>
+          <Database size={20} />
+        </div>
+        <div className="retention-controls">
+          <label>
+            保留期限
+            <select
+              value={retentionDays}
+              disabled={loading || saving}
+              onChange={(event) => setRetentionDays(Number(event.target.value))}
+            >
+              <option value={7}>7 天</option>
+              <option value={30}>30 天</option>
+              <option value={90}>90 天</option>
+              <option value={180}>180 天</option>
+            </select>
+          </label>
+          <button
+            className="secondary"
+            onClick={saveRetention}
+            disabled={loading || saving}
+          >
+            {saving ? "保存中…" : "保存设置"}
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1380,6 +1518,7 @@ function Usage({
     tpm: 0,
     measured_at: "",
   });
+  const [dailyUsage, setDailyUsage] = useState<DailyUsage[]>([]);
 
   const requestPath = useMemo(() => {
     const params = new URLSearchParams({
@@ -1452,6 +1591,21 @@ function Usage({
     };
   }, [refreshToken]);
 
+  useEffect(() => {
+    let active = true;
+    api("/api/stats/timeseries")
+      .then((data: DailyUsage[]) => {
+        if (active) setDailyUsage(data);
+      })
+      .catch((error) => {
+        if ((error as Error).message === "AUTH") onLogout();
+        else notify((error as Error).message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [notify, onLogout, refreshToken]);
+
   const applyFilters = (event: React.FormEvent) => {
     event.preventDefault();
     if (draftFilters.time === "custom") {
@@ -1512,6 +1666,33 @@ function Usage({
           </div>
         </div>
       </div>
+      <section className="panel daily-usage-panel">
+        <div className="panel-head">
+          <div>
+            <span className="eyebrow">DAILY TOTALS</span>
+            <h3>每日 Token</h3>
+            <p className="muted">按北京时间 00:00 汇总，保留最近 30 个自然日。</p>
+          </div>
+          <span className="count-chip">{dailyUsage.length} 天</span>
+        </div>
+        <div className="daily-usage-scroll">
+          <div className="daily-usage-table">
+            <div className="daily-usage-head">
+              <span>日期</span>
+              <span>请求数</span>
+              <span>总 Token</span>
+            </div>
+            {dailyUsage.map((day) => (
+              <div className="daily-usage-row" key={day.day}>
+                <span>{day.day}</span>
+                <span>{fmt(day.requests)}</span>
+                <strong>{fmt(day.tokens)}</strong>
+              </div>
+            ))}
+            {dailyUsage.length === 0 && <Empty text="暂无每日 Token 汇总" />}
+          </div>
+        </div>
+      </section>
       <section className="panel">
         <form className="usage-filters" onSubmit={applyFilters}>
           <div className="usage-filter-time">
@@ -1620,10 +1801,10 @@ function Usage({
         </form>
         <div className="panel-head">
           <div>
-            <h3>Requests</h3>
+            <h3>请求记录</h3>
             <p className="muted">全部历史记录 · 最新完成优先</p>
           </div>
-          <span className="count-chip">{fmt(total)} records</span>
+          <span className="count-chip">{fmt(total)} 条记录</span>
         </div>
         <div className="usage-table-scroll">
           <div className={`data-table usage-table ${loading ? "is-loading" : ""}`}>
@@ -1652,7 +1833,7 @@ function Usage({
                     className={`health ${r.status === "success" ? "healthy" : "cooldown"}`}
                   >
                     <i />
-                    {r.status === "success" ? "success" : `HTTP ${r.status_code}`}
+                    {r.status === "success" ? "成功" : `HTTP ${r.status_code}`}
                   </span>
                   {r.error_message && (
                     <small className="request-error" title={r.error_message}>

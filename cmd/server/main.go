@@ -51,7 +51,16 @@ type loginAttempt struct {
 	BlockedUntil time.Time
 }
 
-const adminSessionPrefix = "admin_session_"
+const (
+	adminSessionPrefix        = "admin_session_"
+	usageRetentionSettingKey  = "usage_retention_days"
+	defaultUsageRetentionDays = 90
+)
+
+var (
+	chinaLocation         = time.FixedZone("Asia/Shanghai", 8*60*60)
+	usageRetentionOptions = map[int]struct{}{7: {}, 30: {}, 90: {}, 180: {}}
+)
 
 type ProxyRecord struct {
 	ID            int64      `json:"id"`
@@ -64,6 +73,7 @@ type ProxyRecord struct {
 	Enabled       bool       `json:"enabled"`
 	HealthStatus  string     `json:"health_status"`
 	FailureCount  int        `json:"failure_count"`
+	UsageState    string     `json:"usage_state,omitempty"`
 	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
@@ -225,6 +235,9 @@ func main() {
 		log.Fatal(err)
 	}
 	app.deleteExpiredProxies()
+	if err := app.deleteExpiredUsage(); err != nil {
+		log.Fatal(err)
+	}
 	go app.expiredProxyJanitor()
 	mux := http.NewServeMux()
 	app.routes(mux)
@@ -475,6 +488,8 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/settings/upstream", a.requireAdmin(a.getUpstream))
 	mux.HandleFunc("PUT /api/settings/upstream", a.requireAdmin(a.putUpstream))
 	mux.HandleFunc("PUT /api/settings/routing", a.requireAdmin(a.putRouting))
+	mux.HandleFunc("GET /api/settings/usage-retention", a.requireAdmin(a.getUsageRetention))
+	mux.HandleFunc("PUT /api/settings/usage-retention", a.requireAdmin(a.putUsageRetention))
 	mux.HandleFunc("POST /api/settings/upstream/test", a.requireAdmin(a.testUpstream))
 	mux.HandleFunc("POST /api/settings/client-key/rotate", a.requireAdmin(a.rotateClientKey))
 	mux.HandleFunc("POST /api/settings/models/refresh", a.requireAdmin(a.refreshModels))
@@ -758,6 +773,69 @@ func (a *App) sessionProxyRequestLimit() int {
 		return defaultLimit
 	}
 	return limit
+}
+
+func (a *App) usageRetentionDays() int {
+	var raw string
+	if a.db.QueryRow("SELECT value FROM settings WHERE key=?", usageRetentionSettingKey).Scan(&raw) != nil {
+		return defaultUsageRetentionDays
+	}
+	days, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultUsageRetentionDays
+	}
+	if _, ok := usageRetentionOptions[days]; !ok {
+		return defaultUsageRetentionDays
+	}
+	return days
+}
+
+func usageRetentionCutoff(days int, now time.Time) string {
+	return now.UTC().AddDate(0, 0, -days).Format(time.RFC3339)
+}
+
+func (a *App) deleteExpiredUsage() error {
+	_, err := a.db.Exec(
+		"DELETE FROM usage_requests WHERE created_at < ?",
+		usageRetentionCutoff(a.usageRetentionDays(), time.Now()),
+	)
+	return err
+}
+
+func (a *App) getUsageRetention(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]int{"usage_retention_days": a.usageRetentionDays()})
+}
+
+func (a *App) putUsageRetention(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Days int `json:"usage_retention_days"`
+	}
+	if readJSON(r, &in) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	if _, ok := usageRetentionOptions[in.Days]; !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "usage_retention_days must be 7, 30, 90, or 180"})
+		return
+	}
+	tx, err := a.db.Begin()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save usage retention"})
+		return
+	}
+	if _, err = tx.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", usageRetentionSettingKey, strconv.Itoa(in.Days)); err == nil {
+		_, err = tx.Exec("DELETE FROM usage_requests WHERE created_at < ?", usageRetentionCutoff(in.Days, time.Now()))
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save usage retention"})
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save usage retention"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "usage_retention_days": in.Days})
 }
 
 func (a *App) clientKeyConfigured() bool {
@@ -2202,6 +2280,9 @@ func (a *App) expiredProxyJanitor() {
 	for range ticker.C {
 		a.deleteExpiredProxies()
 		a.deleteStaleSessionRoutes()
+		if err := a.deleteExpiredUsage(); err != nil {
+			log.Printf("delete expired usage records failed: %v", err)
+		}
 		if err := a.deleteExpiredAdminSessions(); err != nil {
 			log.Printf("delete expired admin sessions failed: %v", err)
 		}
@@ -2271,14 +2352,26 @@ func (a *App) markProxySuccess(id int64) {
 
 func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 	a.deleteExpiredProxies()
+	a.deleteStaleSessionRoutes()
+	query := r.URL.Query()
+	state := strings.TrimSpace(query.Get("state"))
+	if state == "" {
+		state = "all"
+	}
+	now := time.Now().UTC()
+	where, args, ok := proxyFilterClause(state, now)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state must be all, unused, in_use, or cooldown"})
+		return
+	}
 
 	// Keep the original array response for existing API consumers. The console
 	// explicitly requests pagination so large proxy pools are never fetched or
 	// rendered in one response.
-	pageText, hasPage := r.URL.Query()["page"]
-	pageSizeText, hasPageSize := r.URL.Query()["page_size"]
+	pageText, hasPage := query["page"]
+	pageSizeText, hasPageSize := query["page_size"]
 	if !hasPage && !hasPageSize {
-		rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),created_at FROM proxies ORDER BY id DESC")
+		rows, err := a.db.Query(proxySelect+where+" ORDER BY p.id DESC", args...)
 		if err != nil {
 			writeJSON(w, 500, map[string]string{"error": "could not query proxies"})
 			return
@@ -2287,6 +2380,10 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 		proxies, err := scanProxies(rows)
 		if err != nil {
 			writeJSON(w, 500, map[string]string{"error": "could not read proxies"})
+			return
+		}
+		if err := a.annotateProxyUsageStates(proxies, now); err != nil {
+			writeJSON(w, 500, map[string]string{"error": "could not read proxy usage state"})
 			return
 		}
 		writeJSON(w, 200, proxies)
@@ -2305,7 +2402,7 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var total int
-	if err := a.db.QueryRow("SELECT COUNT(*) FROM proxies").Scan(&total); err != nil {
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM proxies p"+where, args...).Scan(&total); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not count proxies"})
 		return
 	}
@@ -2317,7 +2414,8 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 		page = totalPages
 	}
 	offset := (page - 1) * pageSize
-	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),created_at FROM proxies ORDER BY id DESC LIMIT ? OFFSET ?", pageSize, offset)
+	pageArgs := append(append([]any{}, args...), pageSize, offset)
+	rows, err := a.db.Query(proxySelect+where+" ORDER BY p.id DESC LIMIT ? OFFSET ?", pageArgs...)
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query proxies"})
 		return
@@ -2328,6 +2426,10 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not read proxies"})
 		return
 	}
+	if err := a.annotateProxyUsageStates(proxies, now); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "could not read proxy usage state"})
+		return
+	}
 	writeJSON(w, 200, map[string]any{
 		"items":       proxies,
 		"page":        page,
@@ -2335,6 +2437,64 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 		"total":       total,
 		"total_pages": totalPages,
 	})
+}
+
+const proxySelect = "SELECT p.id,p.uri,p.scheme,p.host,p.port,COALESCE(p.username,''),COALESCE(p.encrypted_password,''),p.enabled,p.health_status,p.failure_count,COALESCE(p.cooldown_until,''),COALESCE(p.expires_at,''),p.created_at FROM proxies p"
+
+func proxyFilterClause(state string, now time.Time) (string, []any, bool) {
+	nowText := now.Format(time.RFC3339)
+	activeCutoff := now.Add(-24 * time.Hour).Format(time.RFC3339)
+	cooldownReady := "(p.cooldown_until IS NULL OR p.cooldown_until='' OR p.cooldown_until<=?)"
+	activeRoute := "p.id IN (SELECT proxy_id FROM session_proxy_routes WHERE updated_at>=?)"
+	switch state {
+	case "all":
+		return "", nil, true
+	case "in_use":
+		return " WHERE p.enabled=1 AND " + cooldownReady + " AND " + activeRoute, []any{nowText, activeCutoff}, true
+	case "cooldown":
+		return " WHERE p.cooldown_until IS NOT NULL AND p.cooldown_until<>'' AND p.cooldown_until>?", []any{nowText}, true
+	case "unused":
+		return " WHERE NOT " + activeRoute + " AND " + cooldownReady, []any{activeCutoff, nowText}, true
+	default:
+		return "", nil, false
+	}
+}
+
+func (a *App) annotateProxyUsageStates(proxies []ProxyRecord, now time.Time) error {
+	if len(proxies) == 0 {
+		return nil
+	}
+	rows, err := a.db.Query("SELECT DISTINCT proxy_id FROM session_proxy_routes WHERE updated_at>=?", now.Add(-24*time.Hour).Format(time.RFC3339))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	active := map[int64]struct{}{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		active[id] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range proxies {
+		p := &proxies[i]
+		if p.CooldownUntil != nil && p.CooldownUntil.After(now) {
+			p.UsageState = "cooldown"
+		} else if p.Enabled {
+			if _, ok := active[p.ID]; ok {
+				p.UsageState = "in_use"
+				continue
+			}
+			p.UsageState = "unused"
+		} else {
+			p.UsageState = "unused"
+		}
+	}
+	return nil
 }
 
 func parseProxyPageParam(values []string, defaultValue, min, max int) (int, error) {
@@ -2900,25 +3060,34 @@ func (a *App) usageRates(w http.ResponseWriter, _ *http.Request) {
 }
 func (a *App) statsSummary(w http.ResponseWriter, _ *http.Request) {
 	a.deleteExpiredProxies()
+	now := time.Now().UTC()
+	dayStart := chinaDayStart(now).Format(time.RFC3339)
 	var total, success, pt, ct, tt, free, active int64
 	queries := []struct {
 		query string
+		args  []any
 		dest  []any
 	}{
-		{"SELECT COUNT(*) FROM usage_requests", []any{&total}},
-		{"SELECT COUNT(*) FROM usage_requests WHERE status='success'", []any{&success}},
-		{"SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage_requests", []any{&pt, &ct, &tt}},
-		{"SELECT COUNT(*) FROM models WHERE is_free=1", []any{&free}},
-		{"SELECT COUNT(*) FROM proxies WHERE enabled=1", []any{&active}},
+		{"SELECT COUNT(*) FROM usage_requests", nil, []any{&total}},
+		{"SELECT COUNT(*) FROM usage_requests WHERE status='success'", nil, []any{&success}},
+		{"SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE created_at>=? AND created_at<=?", []any{dayStart, now.Format(time.RFC3339)}, []any{&pt, &ct, &tt}},
+		{"SELECT COUNT(*) FROM models WHERE is_free=1", nil, []any{&free}},
+		{"SELECT COUNT(*) FROM proxies WHERE enabled=1", nil, []any{&active}},
 	}
 	for _, query := range queries {
-		if err := a.db.QueryRow(query.query).Scan(query.dest...); err != nil {
+		if err := a.db.QueryRow(query.query, query.args...).Scan(query.dest...); err != nil {
 			writeJSON(w, 500, map[string]string{"error": "could not calculate summary"})
 			return
 		}
 	}
 	writeJSON(w, 200, map[string]any{"requests": total, "success": success, "success_rate": rate(success, total), "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "free_models": free, "active_proxies": active})
 }
+
+func chinaDayStart(now time.Time) time.Time {
+	local := now.In(chinaLocation)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, chinaLocation).UTC()
+}
+
 func rate(a, b int64) float64 {
 	if b == 0 {
 		return 0
@@ -2926,7 +3095,7 @@ func rate(a, b int64) float64 {
 	return float64(a) / float64(b)
 }
 func (a *App) statsTimeseries(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT substr(created_at,1,10) day,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests GROUP BY day ORDER BY day DESC LIMIT 30")
+	rows, err := a.db.Query("SELECT date(created_at,'+8 hours') day,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests GROUP BY day ORDER BY day DESC LIMIT 30")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query timeseries"})
 		return
