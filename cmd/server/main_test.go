@@ -244,6 +244,99 @@ func TestUsageRecordsDistinguishVisionHelper(t *testing.T) {
 	}
 }
 
+func TestUsageErrorOriginsExcludeExternalFailuresFromSuccessRate(t *testing.T) {
+	a := testApp(t)
+	a.recordUsage("model:free", nil, "", "success", http.StatusOK, time.Millisecond, nil, 0, nil, nil)
+	a.recordUsage("model:free", nil, "", "error", http.StatusBadGateway, time.Millisecond, nil, 0, nil, errors.New("Post upstream: context canceled"))
+	a.recordUsage("model:free", nil, "", "error", http.StatusBadRequest, time.Millisecond, nil, 0, nil, errors.New("unsupported input modality"))
+	a.recordUsageKind("vision_helper", "vision-model", nil, "", "success", http.StatusOK, time.Millisecond, nil, 0, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	a.statsSummary(recorder, httptest.NewRequest(http.MethodGet, "/api/stats/summary", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var summary struct {
+		Requests         int64   `json:"requests"`
+		CountedRequests  int64   `json:"counted_requests"`
+		ExternalRequests int64   `json:"external_requests"`
+		Success          int64   `json:"success"`
+		SuccessRate      float64 `json:"success_rate"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Requests != 3 || summary.CountedRequests != 2 || summary.ExternalRequests != 1 || summary.Success != 1 || summary.SuccessRate != 0.5 {
+		t.Fatalf("external failure affected summary counters: %#v", summary)
+	}
+
+	userErrors := httptest.NewRecorder()
+	a.usageList(userErrors, httptest.NewRequest(http.MethodGet, "/api/usage/requests?page=1&status=error", nil))
+	var userPage struct {
+		Items []usageRequest `json:"items"`
+	}
+	if err := json.NewDecoder(userErrors.Body).Decode(&userPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(userPage.Items) != 1 || userPage.Items[0].ErrorOrigin != "user" {
+		t.Fatalf("user error filter returned wrong records: %#v", userPage.Items)
+	}
+
+	external := httptest.NewRecorder()
+	a.usageList(external, httptest.NewRequest(http.MethodGet, "/api/usage/requests?page=1&status=external", nil))
+	var externalPage struct {
+		Items []usageRequest `json:"items"`
+	}
+	if err := json.NewDecoder(external.Body).Decode(&externalPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(externalPage.Items) != 1 || externalPage.Items[0].ErrorOrigin != "external" {
+		t.Fatalf("external filter returned wrong records: %#v", externalPage.Items)
+	}
+}
+
+func TestUsageErrorOriginClassifiesProviderAndInternalFailures(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		status  string
+		code    int
+		message string
+		want    string
+	}{
+		{name: "successful chat", kind: "chat", status: "success", code: http.StatusOK, want: "none"},
+		{name: "provider validation", kind: "chat", status: "error", code: http.StatusBadRequest, message: "Error from provider (Console): Upstream request failed", want: "external"},
+		{name: "client cancellation", kind: "chat", status: "error", code: 499, message: "context canceled", want: "external"},
+		{name: "gateway failure", kind: "chat", status: "error", code: http.StatusBadGateway, message: "proxyconnect tcp: i/o timeout", want: "external"},
+		{name: "local invalid input", kind: "chat", status: "error", code: http.StatusBadRequest, message: "unsupported input modality", want: "user"},
+		{name: "image helper", kind: "vision_helper", status: "error", code: http.StatusBadRequest, message: "invalid input", want: "internal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := usageErrorOrigin(tc.kind, tc.status, tc.code, tc.message); got != tc.want {
+				t.Fatalf("origin=%q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBackfillUsageErrorOriginsClassifiesExistingRecords(t *testing.T) {
+	a := testApp(t)
+	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,status,status_code,latency_ms,retry_count,error_message) VALUES(?,?,?,?,?,?,?,?)", time.Now().UTC().Format(time.RFC3339), "chat", "model:free", "error", http.StatusBadGateway, 1, 0, "Post upstream: context canceled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backfillUsageErrorOrigins(a.db); err != nil {
+		t.Fatal(err)
+	}
+	var origin string
+	if err := a.db.QueryRow("SELECT error_origin FROM usage_requests").Scan(&origin); err != nil {
+		t.Fatal(err)
+	}
+	if origin != "external" {
+		t.Fatalf("existing external failure origin=%q, want external", origin)
+	}
+}
+
 func TestSSEContentDetectorFindsFirstNonEmptyContentAcrossChunks(t *testing.T) {
 	detector := &sseContentDetector{}
 	if detector.Observe([]byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n")) {

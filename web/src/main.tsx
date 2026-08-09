@@ -29,6 +29,8 @@ import "./security.css";
 
 type Summary = {
   requests: number;
+  counted_requests: number;
+  external_requests: number;
   success: number;
   success_rate: number;
   prompt_tokens: number;
@@ -74,6 +76,7 @@ type RequestRow = {
   proxy_uri?: string;
   status: string;
   status_code: number;
+  error_origin?: "none" | "user" | "external" | "internal";
   latency_ms: number;
   first_token_latency_ms?: number;
   retry_count: number;
@@ -106,7 +109,7 @@ type UsageTimePreset = "all" | "1h" | "24h" | "7d" | "30d" | "custom";
 type UsageFilters = {
   time: UsageTimePreset;
   model: string;
-  status: "" | "success" | "error";
+  status: "" | "success" | "error" | "external";
   customFrom: string;
   customTo: string;
 };
@@ -250,6 +253,8 @@ function Console({
 }) {
   const [summary, setSummary] = useState<Summary>({
     requests: 0,
+    counted_requests: 0,
+    external_requests: 0,
     success: 0,
     success_rate: 0,
     prompt_tokens: 0,
@@ -428,6 +433,7 @@ function Overview({
   rows: RequestRow[];
 }) {
   const success = summary.success_rate * 100;
+  const countedRequests = summary.counted_requests || summary.requests;
   return (
     <div className="page">
       <section className="hero-band">
@@ -479,7 +485,7 @@ function Overview({
         <Stat
           label="成功率"
           value={`${success.toFixed(1)}%`}
-          detail={`${fmt(summary.success)} / ${fmt(summary.requests)} 请求成功`}
+          detail={`${fmt(summary.success)} / ${fmt(countedRequests)} 有效请求成功`}
           accent="#6d8b75"
         />
       </section>
@@ -527,7 +533,7 @@ function Overview({
               {rows.slice(0, 5).map((r) => (
                 <div className="mini-row" key={r.id}>
                   <span
-                    className={`status-dot ${r.status === "success" ? "ok" : "bad"}`}
+                    className={`status-dot ${r.status === "success" ? "ok" : r.error_origin === "external" ? "neutral" : "bad"}`}
                   />
                   <div>
                     <b>{r.model}</b>
@@ -1750,7 +1756,8 @@ function Usage({
             >
               <option value="">全部结果</option>
               <option value="success">成功</option>
-              <option value="error">失败</option>
+              <option value="error">用户错误</option>
+              <option value="external">外部异常</option>
             </select>
           </label>
           {draftFilters.time === "custom" && (
@@ -1830,10 +1837,16 @@ function Usage({
                 </div>
                 <div className="usage-result-cell">
                   <span
-                    className={`health ${r.status === "success" ? "healthy" : "cooldown"}`}
+                    className={`health ${r.status === "success" ? "healthy" : r.error_origin === "external" ? "external" : r.error_origin === "internal" ? "internal" : "cooldown"}`}
                   >
                     <i />
-                    {r.status === "success" ? "成功" : `HTTP ${r.status_code}`}
+                    {r.status === "success"
+                      ? "成功"
+                      : r.error_origin === "external"
+                        ? "外部异常"
+                        : r.error_origin === "internal"
+                          ? "内部步骤"
+                          : `HTTP ${r.status_code}`}
                   </span>
                   {r.error_message && (
                     <small className="request-error" title={r.error_message}>

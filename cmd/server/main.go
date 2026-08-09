@@ -55,6 +55,7 @@ const (
 	adminSessionPrefix        = "admin_session_"
 	usageRetentionSettingKey  = "usage_retention_days"
 	defaultUsageRetentionDays = 90
+	upstreamRequestTimeout    = 120 * time.Second
 )
 
 var (
@@ -119,6 +120,7 @@ type usageRequest struct {
 	CompletionTokens    *int64    `json:"completion_tokens,omitempty"`
 	TotalTokens         *int64    `json:"total_tokens,omitempty"`
 	ErrorMessage        string    `json:"error_message,omitempty"`
+	ErrorOrigin         string    `json:"error_origin"`
 }
 
 type tokenUsage struct {
@@ -241,7 +243,7 @@ func main() {
 	go app.expiredProxyJanitor()
 	mux := http.NewServeMux()
 	app.routes(mux)
-	server := &http.Server{Addr: ":" + port, Handler: app.withMiddleware(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 60 * time.Second, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
+	server := &http.Server{Addr: ":" + port, Handler: app.withMiddleware(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: upstreamRequestTimeout, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
 	log.Printf("opencode proxy pool listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
 }
@@ -292,7 +294,7 @@ func migrate(db *sql.DB) error {
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY AUTOINCREMENT, uri TEXT UNIQUE NOT NULL, scheme TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, username TEXT, encrypted_password TEXT, enabled INTEGER NOT NULL DEFAULT 1, health_status TEXT NOT NULL DEFAULT 'unknown', failure_count INTEGER NOT NULL DEFAULT 0, cooldown_until TEXT, expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS models (id INTEGER PRIMARY KEY AUTOINCREMENT, model_id TEXT UNIQUE NOT NULL, display_name TEXT, is_free INTEGER NOT NULL, free_reason TEXT, pricing_metadata TEXT, raw_metadata TEXT, refreshed_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
+CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS session_proxy_routes (session_key TEXT PRIMARY KEY, proxy_id INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model);`)
 	if err != nil {
@@ -305,6 +307,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"ALTER TABLE usage_requests ADD COLUMN proxy_uri TEXT",
 		"ALTER TABLE usage_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'chat'",
 		"ALTER TABLE usage_requests ADD COLUMN first_token_latency_ms INTEGER",
+		"ALTER TABLE usage_requests ADD COLUMN error_origin TEXT NOT NULL DEFAULT ''",
 	} {
 		if _, alterErr := db.Exec(statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			return alterErr
@@ -314,12 +317,61 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"CREATE INDEX IF NOT EXISTS idx_proxies_expires_at ON proxies(expires_at)",
 		"CREATE INDEX IF NOT EXISTS idx_session_proxy_routes_updated_at ON session_proxy_routes(updated_at)",
 		"CREATE INDEX IF NOT EXISTS idx_usage_status ON usage_requests(status)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_error_origin ON usage_requests(error_origin)",
 	} {
 		if _, indexErr := db.Exec(statement); indexErr != nil {
 			return indexErr
 		}
 	}
-	return nil
+	return backfillUsageErrorOrigins(db)
+}
+
+func backfillUsageErrorOrigins(db *sql.DB) error {
+	rows, err := db.Query("SELECT id,COALESCE(request_kind,'chat'),status,status_code,COALESCE(error_message,'') FROM usage_requests WHERE COALESCE(error_origin,'')=''")
+	if err != nil {
+		return err
+	}
+	type usageOriginUpdate struct {
+		id     int64
+		origin string
+	}
+	updates := []usageOriginUpdate{}
+	for rows.Next() {
+		var id int64
+		var kind, status, message string
+		var code int
+		if err := rows.Scan(&id, &kind, &status, &code, &message); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		updates = append(updates, usageOriginUpdate{id: id, origin: usageErrorOrigin(kind, status, code, message)})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	statement, err := tx.Prepare("UPDATE usage_requests SET error_origin=? WHERE id=?")
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	for _, update := range updates {
+		if _, err := statement.Exec(update.origin, update.id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (a *App) ensureAdmin() error {
@@ -1685,7 +1737,7 @@ func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyR
 func visionRequestContext(r *http.Request) (context.Context, context.CancelFunc) {
 	// The client can cancel a streamed chat request while the helper is still
 	// reading an image. Keep the helper alive briefly, with its own hard limit.
-	return context.WithTimeout(context.WithoutCancel(r.Context()), 90*time.Second)
+	return context.WithTimeout(context.WithoutCancel(r.Context()), upstreamRequestTimeout)
 }
 
 func buildVisionRequest(body []byte, visionModel string) ([]byte, error) {
@@ -1842,7 +1894,7 @@ func addTokenValue(first, second *int64) *int64 {
 func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	tr.ResponseHeaderTimeout = 90 * time.Second
+	tr.ResponseHeaderTimeout = upstreamRequestTimeout
 	if strings.TrimSpace(p.URI) == "" {
 		tr.Proxy = nil
 		return &http.Client{Transport: tr}, nil
@@ -2904,12 +2956,45 @@ func (a *App) recordUsageKind(kind, model string, proxyID *int64, proxyURI, stat
 	if kind == "" {
 		kind = "chat"
 	}
-	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", time.Now().UTC().Format(time.RFC3339), kind, model, id, proxyURI, status, code, lat.Milliseconds(), firstTokenMS, retries, p, c, t, lastErrString(e)); err != nil {
+	errorMessage := lastErrString(e)
+	origin := usageErrorOrigin(kind, status, code, errorMessage)
+	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message,error_origin) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", time.Now().UTC().Format(time.RFC3339), kind, model, id, proxyURI, status, code, lat.Milliseconds(), firstTokenMS, retries, p, c, t, errorMessage, origin); err != nil {
 		log.Printf("record usage failed: %v", err)
 	}
 }
 
-const usageSelect = "SELECT u.id,u.created_at,COALESCE(u.request_kind,'chat'),u.model,u.proxy_id,COALESCE(NULLIF(u.proxy_uri,''),p.uri,''),u.status,u.status_code,u.latency_ms,u.first_token_latency_ms,u.retry_count,u.prompt_tokens,u.completion_tokens,u.total_tokens,COALESCE(u.error_message,'') FROM usage_requests u LEFT JOIN proxies p ON p.id=u.proxy_id"
+func usageErrorOrigin(kind, status string, code int, message string) string {
+	if kind != "chat" {
+		return "internal"
+	}
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if code == 0 || code == 499 || code >= http.StatusInternalServerError || code == http.StatusUnavailableForLegalReasons {
+		return "external"
+	}
+	for _, marker := range []string{
+		"context canceled",
+		"context deadline exceeded",
+		"unexpected eof",
+		"proxyconnect",
+		"not enough bandwidth",
+		"could not locate image content",
+		"vision helper",
+		"error from provider",
+		"upstream request failed",
+		"all proxies failed",
+	} {
+		if strings.Contains(lower, marker) {
+			return "external"
+		}
+	}
+	if status == "success" {
+		return "none"
+	}
+	return "user"
+}
+
+const usageOriginSQL = "COALESCE(NULLIF(u.error_origin,''),'user')"
+const usageSelect = "SELECT u.id,u.created_at,COALESCE(u.request_kind,'chat'),u.model,u.proxy_id,COALESCE(NULLIF(u.proxy_uri,''),p.uri,''),u.status,u.status_code,u.latency_ms,u.first_token_latency_ms,u.retry_count,u.prompt_tokens,u.completion_tokens,u.total_tokens,COALESCE(u.error_message,'')," + usageOriginSQL + " FROM usage_requests u LEFT JOIN proxies p ON p.id=u.proxy_id"
 
 func (a *App) usageList(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
@@ -2945,8 +3030,8 @@ func (a *App) usageList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := strings.TrimSpace(query.Get("status"))
-	if status != "" && status != "success" && status != "error" {
-		writeJSON(w, 400, map[string]string{"error": "status must be success or error"})
+	if status != "" && status != "success" && status != "error" && status != "external" {
+		writeJSON(w, 400, map[string]string{"error": "status must be success, error, or external"})
 		return
 	}
 	fromTime, err := parseUsageTime(query.Get("from"))
@@ -2978,9 +3063,13 @@ func (a *App) usageList(w http.ResponseWriter, r *http.Request) {
 		clauses = append(clauses, "u.model=?")
 		args = append(args, model)
 	}
-	if status != "" {
-		clauses = append(clauses, "u.status=?")
-		args = append(args, status)
+	switch status {
+	case "success":
+		clauses = append(clauses, "u.status='success'")
+	case "error":
+		clauses = append(clauses, "u.status='error'", usageOriginSQL+"='user'")
+	case "external":
+		clauses = append(clauses, "u.status='error'", usageOriginSQL+"='external'")
 	}
 	where := ""
 	if len(clauses) > 0 {
@@ -3043,7 +3132,7 @@ func (a *App) queryUsageRequests(query string, args ...any) ([]usageRequest, err
 	for rows.Next() {
 		var x usageRequest
 		var ts string
-		if err := rows.Scan(&x.ID, &ts, &x.RequestKind, &x.Model, &x.ProxyID, &x.ProxyURI, &x.Status, &x.StatusCode, &x.LatencyMS, &x.FirstTokenLatencyMS, &x.RetryCount, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.ErrorMessage); err != nil {
+		if err := rows.Scan(&x.ID, &ts, &x.RequestKind, &x.Model, &x.ProxyID, &x.ProxyURI, &x.Status, &x.StatusCode, &x.LatencyMS, &x.FirstTokenLatencyMS, &x.RetryCount, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.ErrorMessage, &x.ErrorOrigin); err != nil {
 			return nil, err
 		}
 		x.CreatedAt, _ = time.Parse(time.RFC3339, ts)
@@ -3079,7 +3168,7 @@ func (a *App) usageRates(w http.ResponseWriter, _ *http.Request) {
 	now := time.Now().UTC()
 	cutoff := now.Add(-time.Minute).Format(time.RFC3339)
 	var rpm, tpm int64
-	if err := a.db.QueryRow("SELECT COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE created_at>=? AND created_at<=?", cutoff, now.Format(time.RFC3339)).Scan(&rpm, &tpm); err != nil {
+	if err := a.db.QueryRow("SELECT COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE request_kind='chat' AND created_at>=? AND created_at<=?", cutoff, now.Format(time.RFC3339)).Scan(&rpm, &tpm); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not calculate usage rates"})
 		return
 	}
@@ -3094,15 +3183,17 @@ func (a *App) statsSummary(w http.ResponseWriter, _ *http.Request) {
 	a.deleteExpiredProxies()
 	now := time.Now().UTC()
 	dayStart := chinaDayStart(now).Format(time.RFC3339)
-	var total, success, pt, ct, tt, free, active int64
+	var total, counted, external, success, pt, ct, tt, free, active int64
 	queries := []struct {
 		query string
 		args  []any
 		dest  []any
 	}{
-		{"SELECT COUNT(*) FROM usage_requests", nil, []any{&total}},
-		{"SELECT COUNT(*) FROM usage_requests WHERE status='success'", nil, []any{&success}},
-		{"SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE created_at>=? AND created_at<=?", []any{dayStart, now.Format(time.RFC3339)}, []any{&pt, &ct, &tt}},
+		{"SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat'", nil, []any{&total}},
+		{"SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND status='success'", nil, []any{&success}},
+		{"SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND COALESCE(NULLIF(error_origin,''),'user')<>'external'", nil, []any{&counted}},
+		{"SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND COALESCE(NULLIF(error_origin,''),'user')='external'", nil, []any{&external}},
+		{"SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE request_kind='chat' AND created_at>=? AND created_at<=?", []any{dayStart, now.Format(time.RFC3339)}, []any{&pt, &ct, &tt}},
 		{"SELECT COUNT(*) FROM models WHERE is_free=1", nil, []any{&free}},
 		{"SELECT COUNT(*) FROM proxies WHERE enabled=1", nil, []any{&active}},
 	}
@@ -3112,7 +3203,7 @@ func (a *App) statsSummary(w http.ResponseWriter, _ *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, 200, map[string]any{"requests": total, "success": success, "success_rate": rate(success, total), "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "free_models": free, "active_proxies": active})
+	writeJSON(w, 200, map[string]any{"requests": total, "counted_requests": counted, "external_requests": external, "success": success, "success_rate": rate(success, counted), "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "free_models": free, "active_proxies": active})
 }
 
 func chinaDayStart(now time.Time) time.Time {
@@ -3127,7 +3218,7 @@ func rate(a, b int64) float64 {
 	return float64(a) / float64(b)
 }
 func (a *App) statsTimeseries(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT date(created_at,'+8 hours') day,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests GROUP BY day ORDER BY day DESC LIMIT 30")
+	rows, err := a.db.Query("SELECT date(created_at,'+8 hours') day,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE request_kind='chat' GROUP BY day ORDER BY day DESC LIMIT 30")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query timeseries"})
 		return
@@ -3150,7 +3241,7 @@ func (a *App) statsTimeseries(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, out)
 }
 func (a *App) statsModels(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT model,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests GROUP BY model ORDER BY COUNT(*) DESC")
+	rows, err := a.db.Query("SELECT model,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE request_kind='chat' GROUP BY model ORDER BY COUNT(*) DESC")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query model statistics"})
 		return

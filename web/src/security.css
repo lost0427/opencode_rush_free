@@ -4,6 +4,26 @@
   gap: 12px;
   align-items: end;
 }
+
+.status-dot.neutral {
+  background: #b2965c;
+}
+
+.health.external {
+  color: #917643;
+}
+
+.health.external i {
+  background: #b2965c;
+}
+
+.health.internal {
+  color: #70786f;
+}
+
+.health.internal i {
+  background: #969c91;
+}
 .stat-grid {
   grid-template-columns: repeat(5, minmax(0, 1fr));
 }
