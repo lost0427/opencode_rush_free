@@ -193,6 +193,25 @@ func TestVisionBridgeTransformsImageContent(t *testing.T) {
 	}
 }
 
+func TestVisionBridgeOnlyUsesMessageImageContent(t *testing.T) {
+	toolSchemaOnly := []byte(`{"model":"text-model:free","messages":[{"role":"user","content":"describe the file"}],"tools":[{"type":"function","function":{"name":"inspect","parameters":{"type":"object","properties":{"image_url":{"type":"string"}}}}}]}`)
+	if requestHasImageInput(toolSchemaOnly) {
+		t.Fatal("an image_url field in a tool schema was treated as image input")
+	}
+
+	objectContent := []byte(`{"model":"text-model:free","messages":[{"role":"user","content":{"type":"input_image","image_url":"https://example.test/image.png"}}]}`)
+	if !requestHasImageInput(objectContent) {
+		t.Fatal("object-form image content was not detected")
+	}
+	rewritten, err := replaceImageContent(objectContent, "a green triangle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestHasImageInput(rewritten) || !strings.Contains(string(rewritten), "a green triangle") {
+		t.Fatalf("object-form image content was not safely rewritten: %s", rewritten)
+	}
+}
+
 func TestVisionRequestContextSurvivesClientCancellation(t *testing.T) {
 	parent, cancelParent := context.WithCancel(context.Background())
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(parent)

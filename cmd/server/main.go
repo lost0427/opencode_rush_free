@@ -1775,31 +1775,46 @@ func replaceImageContent(body []byte, description string) ([]byte, error) {
 		if !ok {
 			continue
 		}
-		content, ok := message["content"].([]any)
+		content, ok := message["content"]
 		if !ok {
 			continue
 		}
-		rewritten := make([]any, 0, len(content))
-		for _, rawPart := range content {
-			part, ok := rawPart.(map[string]any)
-			if !ok {
-				rewritten = append(rewritten, rawPart)
-				continue
-			}
-			kind, _ := part["type"].(string)
-			if _, imageURL := part["image_url"]; imageURL || strings.EqualFold(kind, "image_url") || strings.EqualFold(kind, "input_image") || strings.EqualFold(kind, "image") {
-				rewritten = append(rewritten, map[string]any{"type": "text", "text": "[图片内容]\n" + description})
-				replaced = true
-				continue
-			}
-			rewritten = append(rewritten, rawPart)
+		rewritten, found := replaceImageContentValue(content, description)
+		if !found {
+			continue
 		}
 		message["content"] = rewritten
+		replaced = true
 	}
 	if !replaced {
 		return nil, errors.New("could not locate image content in chat messages")
 	}
 	return json.Marshal(payload)
+}
+
+func replaceImageContentValue(content any, description string) (any, bool) {
+	if isImageContentPart(content) {
+		return imageDescriptionContent(description), true
+	}
+	parts, ok := content.([]any)
+	if !ok {
+		return content, false
+	}
+	rewritten := make([]any, 0, len(parts))
+	replaced := false
+	for _, part := range parts {
+		if isImageContentPart(part) {
+			rewritten = append(rewritten, imageDescriptionContent(description))
+			replaced = true
+			continue
+		}
+		rewritten = append(rewritten, part)
+	}
+	return rewritten, replaced
+}
+
+func imageDescriptionContent(description string) map[string]any {
+	return map[string]any{"type": "text", "text": "[\u56fe\u7247\u5185\u5bb9]\n" + description}
 }
 
 func addTokenUsage(first, second *tokenUsage) *tokenUsage {
@@ -2063,38 +2078,55 @@ func (w *limitedCapture) Bytes() []byte {
 }
 
 func requestHasImageInput(body []byte) bool {
-	var payload any
+	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
 		return false
 	}
-	return containsImageInput(payload)
-}
-
-func containsImageInput(value any) bool {
-	switch current := value.(type) {
-	case []any:
-		for _, item := range current {
-			if containsImageInput(item) {
-				return true
-			}
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok {
+			continue
 		}
-	case map[string]any:
-		if _, ok := current["image_url"]; ok {
+		if content, ok := message["content"]; ok && containsImageContent(content) {
 			return true
-		}
-		if kind, ok := current["type"].(string); ok {
-			kind = strings.ToLower(strings.TrimSpace(kind))
-			if kind == "image_url" || kind == "input_image" || kind == "image" {
-				return true
-			}
-		}
-		for _, item := range current {
-			if containsImageInput(item) {
-				return true
-			}
 		}
 	}
 	return false
+}
+
+func containsImageContent(content any) bool {
+	if isImageContentPart(content) {
+		return true
+	}
+	parts, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, part := range parts {
+		if isImageContentPart(part) {
+			return true
+		}
+	}
+	return false
+}
+
+func isImageContentPart(value any) bool {
+	part, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	if kind, ok := part["type"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(kind)) {
+		case "image_url", "input_image", "image":
+			return true
+		}
+	}
+	_, hasImageURL := part["image_url"]
+	return hasImageURL
 }
 
 func (a *App) cachedModelSupportsImage(model string) (known, supported bool) {
