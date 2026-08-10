@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,23 +30,33 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/proxy"
-	_ "modernc.org/sqlite"
+	moderncsqlite "modernc.org/sqlite"
 )
 
 type App struct {
-	db                *sql.DB
-	key               []byte
-	session           string
-	admin             string
-	cookieSecure      bool
-	loginMu           sync.Mutex
-	loginAttempts     map[string]loginAttempt
-	routingMu         sync.Mutex
-	resinMu           sync.Mutex
-	resinFailureCount int
-	resinFailureStart time.Time
-	gatewaySem        chan struct{}
-	rr                atomic.Uint64
+	db                      *sql.DB
+	key                     []byte
+	session                 string
+	admin                   string
+	cookieSecure            bool
+	loginMu                 sync.Mutex
+	loginAttempts           map[string]loginAttempt
+	routingLocks            [64]sync.Mutex
+	resinMu                 sync.Mutex
+	resinFailureCount       int
+	resinFailureStart       time.Time
+	resinLastSuccessPersist time.Time
+	resinProbeMu            sync.Mutex
+	resinLastAutoProbe      time.Time
+	gatewaySem              chan struct{}
+	rr                      atomic.Uint64
+	proxyRuntime            *proxyRuntime
+	keyLimiter              *clientKeyLimiter
+	probeJobs               *probeJobStore
+	alerts                  *alertDispatcher
+	runtimeInitOnce         sync.Once
+	runtimeCaches           runtimeCaches
+	usageInsertStmt         *sql.Stmt
 }
 
 type loginAttempt struct {
@@ -67,32 +78,39 @@ var (
 )
 
 type ProxyRecord struct {
-	ID            int64      `json:"id"`
-	URI           string     `json:"uri"`
-	Scheme        string     `json:"scheme"`
-	Host          string     `json:"host"`
-	Port          int        `json:"port"`
-	Username      string     `json:"username,omitempty"`
-	Password      string     `json:"-"`
-	Engine        string     `json:"-"`
-	Enabled       bool       `json:"enabled"`
-	HealthStatus  string     `json:"health_status"`
-	FailureCount  int        `json:"failure_count"`
-	UsageState    string     `json:"usage_state,omitempty"`
-	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
-	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID                  int64      `json:"id"`
+	URI                 string     `json:"uri"`
+	Scheme              string     `json:"scheme"`
+	Host                string     `json:"host"`
+	Port                int        `json:"port"`
+	Username            string     `json:"username,omitempty"`
+	Password            string     `json:"-"`
+	Engine              string     `json:"-"`
+	Enabled             bool       `json:"enabled"`
+	HealthStatus        string     `json:"health_status"`
+	FailureCount        int        `json:"failure_count"`
+	UsageState          string     `json:"usage_state,omitempty"`
+	CooldownUntil       *time.Time `json:"cooldown_until,omitempty"`
+	ExpiresAt           *time.Time `json:"expires_at,omitempty"`
+	LastProbeAt         *time.Time `json:"last_probe_at,omitempty"`
+	LastProbeMS         *int64     `json:"last_probe_latency_ms,omitempty"`
+	LastExitIP          string     `json:"last_exit_ip,omitempty"`
+	LastProbeError      string     `json:"last_probe_error,omitempty"`
+	UpstreamProbeAt     *time.Time `json:"upstream_probe_at,omitempty"`
+	UpstreamProbeStatus string     `json:"upstream_probe_status,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 type ModelRecord struct {
-	ID          int64           `json:"id"`
-	ModelID     string          `json:"model_id"`
-	DisplayName string          `json:"display_name"`
-	IsFree      bool            `json:"is_free"`
-	FreeReason  string          `json:"free_reason"`
-	Pricing     json.RawMessage `json:"pricing_metadata,omitempty"`
-	Raw         json.RawMessage `json:"raw_metadata,omitempty"`
-	RefreshedAt time.Time       `json:"refreshed_at"`
+	ID           int64           `json:"id"`
+	ModelID      string          `json:"model_id"`
+	DisplayName  string          `json:"display_name"`
+	IsFree       bool            `json:"is_free"`
+	FreeReason   string          `json:"free_reason"`
+	Pricing      json.RawMessage `json:"pricing_metadata,omitempty"`
+	Raw          json.RawMessage `json:"raw_metadata,omitempty"`
+	AdminEnabled bool            `json:"admin_enabled"`
+	RefreshedAt  time.Time       `json:"refreshed_at"`
 }
 
 type upstreamConfig struct {
@@ -109,29 +127,53 @@ type upstreamConfig struct {
 }
 
 type usageRequest struct {
-	ID                  int64     `json:"id"`
-	CreatedAt           time.Time `json:"created_at"`
-	RequestKind         string    `json:"request_kind"`
-	Model               string    `json:"model"`
-	ProxyID             *int64    `json:"proxy_id,omitempty"`
-	ProxyURI            string    `json:"proxy_uri,omitempty"`
-	Status              string    `json:"status"`
-	StatusCode          int       `json:"status_code"`
-	LatencyMS           int64     `json:"latency_ms"`
-	FirstTokenLatencyMS *int64    `json:"first_token_latency_ms,omitempty"`
-	RetryCount          int       `json:"retry_count"`
-	PromptTokens        *int64    `json:"prompt_tokens,omitempty"`
-	CompletionTokens    *int64    `json:"completion_tokens,omitempty"`
-	TotalTokens         *int64    `json:"total_tokens,omitempty"`
-	ErrorMessage        string    `json:"error_message,omitempty"`
-	ErrorOrigin         string    `json:"error_origin"`
-	RouteEngine         string    `json:"route_engine"`
+	ID                  int64           `json:"id"`
+	CreatedAt           time.Time       `json:"created_at"`
+	RequestKind         string          `json:"request_kind"`
+	Model               string          `json:"model"`
+	ResolvedModel       string          `json:"resolved_model,omitempty"`
+	ClientKeyID         *int64          `json:"client_key_id,omitempty"`
+	ClientKeyName       string          `json:"client_key_name,omitempty"`
+	ProxyID             *int64          `json:"proxy_id,omitempty"`
+	ProxyURI            string          `json:"proxy_uri,omitempty"`
+	Status              string          `json:"status"`
+	StatusCode          int             `json:"status_code"`
+	LatencyMS           int64           `json:"latency_ms"`
+	FirstTokenLatencyMS *int64          `json:"first_token_latency_ms,omitempty"`
+	RetryCount          int             `json:"retry_count"`
+	PromptTokens        *int64          `json:"prompt_tokens,omitempty"`
+	CompletionTokens    *int64          `json:"completion_tokens,omitempty"`
+	TotalTokens         *int64          `json:"total_tokens,omitempty"`
+	ErrorMessage        string          `json:"error_message,omitempty"`
+	ErrorOrigin         string          `json:"error_origin"`
+	RouteEngine         string          `json:"route_engine"`
+	AttemptSummary      json.RawMessage `json:"attempt_summary,omitempty"`
 }
 
 type tokenUsage struct {
 	Prompt     *int64
 	Completion *int64
 	Total      *int64
+}
+
+type chatEnvelope struct {
+	Model    string          `json:"model"`
+	User     json.RawMessage `json:"user"`
+	Messages []any           `json:"messages"`
+}
+
+func parseChatEnvelope(body []byte) (chatEnvelope, map[string]any, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return chatEnvelope{}, nil, err
+	}
+	model, _ := payload["model"].(string)
+	messages, messagesOK := payload["messages"].([]any)
+	if rawMessages, present := payload["messages"]; present && rawMessages != nil && !messagesOK {
+		return chatEnvelope{}, nil, errors.New("messages must be an array")
+	}
+	user, _ := json.Marshal(payload["user"])
+	return chatEnvelope{Model: model, User: user, Messages: messages}, payload, nil
 }
 
 var defaultUpstreamHeaders = map[string]string{
@@ -174,21 +216,30 @@ func main() {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
 		log.Fatal(err)
 	}
+	moderncsqlite.RegisterConnectionHook(func(conn moderncsqlite.ExecQuerierContext, _ string) error {
+		_, err := conn.ExecContext(context.Background(), "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL", nil)
+		return err
+	})
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
-	// A single pooled connection serializes SQLite writers. busy_timeout also
-	// protects against short-lived locks from backup and maintenance tools.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// WAL allows concurrent readers while SQLite still serializes writers. The
+	// per-connection hook above applies the lock timeout to every pooled conn.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 	if err := migrate(db); err != nil {
 		log.Fatal(err)
 	}
 	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		log.Fatal(err)
 	}
+	usageInsertStmt, err := db.Prepare("INSERT INTO usage_requests(created_at,request_kind,model,resolved_model,client_key_id,client_key_name,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message,error_origin,route_engine,attempt_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer usageInsertStmt.Close()
 	appKey := []byte(os.Getenv("APP_ENCRYPTION_KEY"))
 	if len(appKey) < 32 {
 		log.Fatal("APP_ENCRYPTION_KEY must contain at least 32 characters")
@@ -213,13 +264,14 @@ func main() {
 	}
 	h := sha256.Sum256(appKey)
 	app := &App{
-		db:            db,
-		key:           h[:],
-		session:       sessionSecret,
-		admin:         os.Getenv("ADMIN_PASSWORD"),
-		cookieSecure:  cookieSecure,
-		loginAttempts: make(map[string]loginAttempt),
-		gatewaySem:    make(chan struct{}, maxConcurrent),
+		db:              db,
+		key:             h[:],
+		session:         sessionSecret,
+		admin:           os.Getenv("ADMIN_PASSWORD"),
+		cookieSecure:    cookieSecure,
+		loginAttempts:   make(map[string]loginAttempt),
+		gatewaySem:      make(chan struct{}, maxConcurrent),
+		usageInsertStmt: usageInsertStmt,
 	}
 	if err := app.ensureAdmin(); err != nil {
 		log.Fatal(err)
@@ -241,11 +293,19 @@ func main() {
 	if err := app.ensureClientKey(); err != nil {
 		log.Fatal(err)
 	}
+	if err := app.migrateLegacyClientKey(); err != nil {
+		log.Fatal(err)
+	}
+	app.initializeRuntimeServices()
 	app.deleteExpiredProxies()
 	if err := app.deleteExpiredUsage(); err != nil {
 		log.Fatal(err)
 	}
 	go app.expiredProxyJanitor()
+	go app.proxyProbeJanitor()
+	go app.modelRefreshJanitor()
+	go app.alerts.run()
+	go app.alertEvaluationJanitor()
 	mux := http.NewServeMux()
 	app.routes(mux)
 	server := &http.Server{Addr: ":" + port, Handler: app.withMiddleware(mux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: upstreamRequestTimeout, WriteTimeout: 0, IdleTimeout: 120 * time.Second}
@@ -299,9 +359,15 @@ func migrate(db *sql.DB) error {
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY AUTOINCREMENT, uri TEXT UNIQUE NOT NULL, scheme TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, username TEXT, encrypted_password TEXT, enabled INTEGER NOT NULL DEFAULT 1, health_status TEXT NOT NULL DEFAULT 'unknown', failure_count INTEGER NOT NULL DEFAULT 0, cooldown_until TEXT, expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS models (id INTEGER PRIMARY KEY AUTOINCREMENT, model_id TEXT UNIQUE NOT NULL, display_name TEXT, is_free INTEGER NOT NULL, free_reason TEXT, pricing_metadata TEXT, raw_metadata TEXT, refreshed_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT 'builtin', FOREIGN KEY(proxy_id) REFERENCES proxies(id));
+CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, resolved_model TEXT, client_key_id INTEGER, client_key_name TEXT, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT 'builtin', attempt_summary TEXT, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS session_proxy_routes (session_key TEXT PRIMARY KEY, proxy_id INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS resin_session_routes (session_key TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, request_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS client_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_hint TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, expires_at TEXT, rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0, last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS model_policies (model_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS model_aliases (id INTEGER PRIMARY KEY AUTOINCREMENT, alias TEXT NOT NULL UNIQUE, target_model_id TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe_key TEXT NOT NULL, event_type TEXT NOT NULL, severity TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, created_at TEXT NOT NULL, delivered_at TEXT, last_error TEXT);
+CREATE TABLE IF NOT EXISTS proxy_probe_jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, mode TEXT NOT NULL, total INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS proxy_probe_results (job_id TEXT NOT NULL, proxy_id INTEGER NOT NULL, uri TEXT NOT NULL, exit_ok INTEGER NOT NULL DEFAULT 0, exit_ip TEXT, exit_latency_ms INTEGER, upstream_status TEXT, error TEXT, PRIMARY KEY(job_id,proxy_id), FOREIGN KEY(job_id) REFERENCES proxy_probe_jobs(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_requests(model);`)
 	if err != nil {
 		return err
@@ -316,6 +382,16 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"ALTER TABLE usage_requests ADD COLUMN first_token_latency_ms INTEGER",
 		"ALTER TABLE usage_requests ADD COLUMN error_origin TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE usage_requests ADD COLUMN route_engine TEXT NOT NULL DEFAULT 'builtin'",
+		"ALTER TABLE usage_requests ADD COLUMN resolved_model TEXT",
+		"ALTER TABLE usage_requests ADD COLUMN client_key_id INTEGER",
+		"ALTER TABLE usage_requests ADD COLUMN client_key_name TEXT",
+		"ALTER TABLE usage_requests ADD COLUMN attempt_summary TEXT",
+		"ALTER TABLE proxies ADD COLUMN last_probe_at TEXT",
+		"ALTER TABLE proxies ADD COLUMN last_probe_latency_ms INTEGER",
+		"ALTER TABLE proxies ADD COLUMN last_exit_ip TEXT",
+		"ALTER TABLE proxies ADD COLUMN last_probe_error TEXT",
+		"ALTER TABLE proxies ADD COLUMN upstream_probe_at TEXT",
+		"ALTER TABLE proxies ADD COLUMN upstream_probe_status TEXT",
 	} {
 		if _, alterErr := db.Exec(statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			return alterErr
@@ -327,6 +403,13 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"CREATE INDEX IF NOT EXISTS idx_usage_status ON usage_requests(status)",
 		"CREATE INDEX IF NOT EXISTS idx_usage_error_origin ON usage_requests(error_origin)",
 		"CREATE INDEX IF NOT EXISTS idx_resin_session_routes_updated_at ON resin_session_routes(updated_at)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_client_key_created ON usage_requests(client_key_id,created_at)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_kind_created ON usage_requests(request_kind,created_at)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_kind_status_created ON usage_requests(request_kind,status,created_at)",
+		"CREATE INDEX IF NOT EXISTS idx_usage_model_created ON usage_requests(model,created_at)",
+		"CREATE INDEX IF NOT EXISTS idx_client_keys_hash ON client_keys(key_hash)",
+		"CREATE INDEX IF NOT EXISTS idx_alert_events_due ON alert_events(status,next_attempt_at)",
+		"CREATE INDEX IF NOT EXISTS idx_proxy_probe_jobs_expires ON proxy_probe_jobs(expires_at)",
 	} {
 		if _, indexErr := db.Exec(statement); indexErr != nil {
 			return indexErr
@@ -336,6 +419,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		return err
 	}
 	_, err = db.Exec("UPDATE usage_requests SET route_engine=CASE WHEN COALESCE(proxy_uri,'')='' AND proxy_id IS NULL THEN 'direct' ELSE 'builtin' END WHERE COALESCE(route_engine,'')='' OR route_engine='builtin'")
+	if err != nil {
+		return err
+	}
+	// Probe execution is process-local. Keep completed and interrupted reports
+	// queryable for their normal retention period after a restart.
+	_, err = db.Exec("UPDATE proxy_probe_jobs SET status='interrupted' WHERE status='running'")
 	return err
 }
 
@@ -561,9 +650,21 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/settings/usage-retention", a.requireAdmin(a.putUsageRetention))
 	mux.HandleFunc("POST /api/settings/upstream/test", a.requireAdmin(a.testUpstream))
 	mux.HandleFunc("POST /api/settings/client-key/rotate", a.requireAdmin(a.rotateClientKey))
+	mux.HandleFunc("GET /api/client-keys", a.requireAdmin(a.listClientKeys))
+	mux.HandleFunc("POST /api/client-keys", a.requireAdmin(a.createClientKey))
+	mux.HandleFunc("PATCH /api/client-keys/{id}", a.requireAdmin(a.patchClientKey))
+	mux.HandleFunc("DELETE /api/client-keys/{id}", a.requireAdmin(a.deleteClientKey))
+	mux.HandleFunc("POST /api/client-keys/{id}/rotate", a.requireAdmin(a.rotateNamedClientKey))
 	mux.HandleFunc("POST /api/settings/models/refresh", a.requireAdmin(a.refreshModels))
+	mux.HandleFunc("GET /api/settings/model-refresh", a.requireAdmin(a.getModelRefreshSettings))
+	mux.HandleFunc("PUT /api/settings/model-refresh", a.requireAdmin(a.putModelRefreshSettings))
 	mux.HandleFunc("GET /api/models", a.requireAdmin(a.listModels))
 	mux.HandleFunc("GET /api/models/free", a.requireAdmin(a.listFreeModels))
+	mux.HandleFunc("PATCH /api/models/{id}/policy", a.requireAdmin(a.patchModelPolicy))
+	mux.HandleFunc("GET /api/model-aliases", a.requireAdmin(a.listModelAliases))
+	mux.HandleFunc("POST /api/model-aliases", a.requireAdmin(a.createModelAlias))
+	mux.HandleFunc("PATCH /api/model-aliases/{id}", a.requireAdmin(a.patchModelAlias))
+	mux.HandleFunc("DELETE /api/model-aliases/{id}", a.requireAdmin(a.deleteModelAlias))
 	mux.HandleFunc("GET /api/proxies", a.requireAdmin(a.listProxies))
 	mux.HandleFunc("POST /api/proxies", a.requireAdmin(a.addProxy))
 	mux.HandleFunc("POST /api/proxies/import", a.requireAdmin(a.importProxies))
@@ -571,11 +672,18 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/proxies/{id}", a.requireAdmin(a.patchProxy))
 	mux.HandleFunc("DELETE /api/proxies/{id}", a.requireAdmin(a.deleteProxy))
 	mux.HandleFunc("POST /api/proxies/{id}/test", a.requireAdmin(a.testProxy))
+	mux.HandleFunc("POST /api/proxy-probes", a.requireAdmin(a.createProxyProbeJob))
+	mux.HandleFunc("GET /api/proxy-probes/{id}", a.requireAdmin(a.getProxyProbeJob))
 	mux.HandleFunc("GET /api/stats/summary", a.requireAdmin(a.statsSummary))
 	mux.HandleFunc("GET /api/stats/timeseries", a.requireAdmin(a.statsTimeseries))
 	mux.HandleFunc("GET /api/stats/models", a.requireAdmin(a.statsModels))
+	mux.HandleFunc("GET /api/stats/proxies", a.requireAdmin(a.statsProxies))
 	mux.HandleFunc("GET /api/usage/requests", a.requireAdmin(a.usageList))
 	mux.HandleFunc("GET /api/usage/rates", a.requireAdmin(a.usageRates))
+	mux.HandleFunc("GET /api/settings/probes", a.requireAdmin(a.getProbeSettings))
+	mux.HandleFunc("PUT /api/settings/probes", a.requireAdmin(a.putProbeSettings))
+	mux.HandleFunc("GET /api/settings/alerts", a.requireAdmin(a.getAlertSettings))
+	mux.HandleFunc("PUT /api/settings/alerts", a.requireAdmin(a.putAlertSettings))
 	webDir := getenv("WEB_DIR", "./web/dist")
 	mux.HandleFunc("/", serveSPA(webDir))
 }
@@ -828,20 +936,12 @@ func (a *App) putRouting(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not save routing configuration"})
 		return
 	}
+	a.invalidateRoutingLimit()
 	writeJSON(w, 200, map[string]any{"ok": true, "session_proxy_request_limit": in.SessionProxyRequestLimit})
 }
 
 func (a *App) sessionProxyRequestLimit() int {
-	const defaultLimit = 50
-	var raw string
-	if a.db.QueryRow("SELECT value FROM settings WHERE key='session_proxy_request_limit'").Scan(&raw) != nil {
-		return defaultLimit
-	}
-	limit, err := strconv.Atoi(raw)
-	if err != nil || limit < 0 || limit > 100000 {
-		return defaultLimit
-	}
-	return limit
+	return a.cachedRoutingLimit()
 }
 
 func (a *App) usageRetentionDays() int {
@@ -912,18 +1012,6 @@ func (a *App) clientKeyConfigured() bool {
 	return a.db.QueryRow("SELECT value FROM settings WHERE key='client_key'").Scan(&hash) == nil && hash != ""
 }
 
-func (a *App) rotateClientKey(w http.ResponseWriter, _ *http.Request) {
-	key, err := randomKey()
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not generate client key"})
-		return
-	}
-	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('client_key',?)", hashToken(key)); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not rotate client key"})
-		return
-	}
-	writeJSON(w, 200, map[string]any{"client_key": key, "warning": "copy this key now; it will not be shown again"})
-}
 func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		BaseURL        string             `json:"base_url"`
@@ -943,7 +1031,11 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": e.Error()})
 		return
 	}
-	old, _ := a.loadUpstream()
+	old, loadErr := a.loadUpstream()
+	if loadErr != nil {
+		writeJSON(w, 500, map[string]string{"error": loadErr.Error()})
+		return
+	}
 	in.APIKey = normalizeAPIKey(in.APIKey)
 	in.VisionBaseURL = strings.TrimSpace(in.VisionBaseURL)
 	if in.VisionBaseURL != "" {
@@ -1003,9 +1095,33 @@ func (a *App) putUpstream(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
 	}
+	a.invalidateUpstreamCache()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *App) loadUpstream() (upstreamConfig, error) {
+	a.runtimeCaches.upstream.mu.RLock()
+	if a.runtimeCaches.upstream.loaded {
+		cfg := cloneUpstreamConfig(a.runtimeCaches.upstream.cfg)
+		a.runtimeCaches.upstream.mu.RUnlock()
+		return cfg, nil
+	}
+	a.runtimeCaches.upstream.mu.RUnlock()
+
+	a.runtimeCaches.upstream.mu.Lock()
+	defer a.runtimeCaches.upstream.mu.Unlock()
+	if a.runtimeCaches.upstream.loaded {
+		return cloneUpstreamConfig(a.runtimeCaches.upstream.cfg), nil
+	}
+	cfg, err := a.loadUpstreamFromDB()
+	if err != nil {
+		return cfg, err
+	}
+	a.runtimeCaches.upstream.cfg = cloneUpstreamConfig(cfg)
+	a.runtimeCaches.upstream.loaded = true
+	return cloneUpstreamConfig(cfg), nil
+}
+
+func (a *App) loadUpstreamFromDB() (upstreamConfig, error) {
 	cfg := upstreamConfig{CustomHeaders: defaultHeaders(), VisionUseProxy: true}
 	var b, e string
 	err := a.db.QueryRow("SELECT value FROM settings WHERE key='upstream_base_url'").Scan(&b)
@@ -1202,7 +1318,6 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": clientErr.Error()})
 		return
 	}
-	client.Timeout = 90 * time.Second
 	resp, e := client.Do(req)
 	if e != nil {
 		if engine == proxyEngineResin {
@@ -1236,17 +1351,14 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
 	}
-	if _, e = tx.Exec("DELETE FROM models"); e != nil {
-		_ = tx.Rollback()
-		writeJSON(w, 500, map[string]string{"error": "could not replace model cache"})
-		return
-	}
 	free := 0
+	seenModels := []string{}
 	for _, m := range payload.Data {
 		id, _ := m["id"].(string)
 		if id == "" {
 			continue
 		}
+		seenModels = append(seenModels, id)
 		raw, _ := json.Marshal(m)
 		display := id
 		if v, ok := m["name"].(string); ok && v != "" {
@@ -1257,7 +1369,7 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		if isFree {
 			free++
 		}
-		if _, e = tx.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,pricing_metadata,raw_metadata,refreshed_at) VALUES(?,?,?,?,?,?,?)", id, display, boolInt(isFree), reason, string(pricing), string(raw), now.Format(time.RFC3339)); e != nil {
+		if _, e = tx.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,pricing_metadata,raw_metadata,refreshed_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(model_id) DO UPDATE SET display_name=excluded.display_name,is_free=excluded.is_free,free_reason=excluded.free_reason,pricing_metadata=excluded.pricing_metadata,raw_metadata=excluded.raw_metadata,refreshed_at=excluded.refreshed_at", id, display, boolInt(isFree), reason, string(pricing), string(raw), now.Format(time.RFC3339)); e != nil {
 			_ = tx.Rollback()
 			writeJSON(w, 500, map[string]string{"error": e.Error()})
 			return
@@ -1269,6 +1381,17 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "free_model_count": 0, "warning": "no free models detected; previous cache was kept"})
 		return
 	}
+	placeholders := make([]string, len(seenModels))
+	args := make([]any, len(seenModels))
+	for i, modelID := range seenModels {
+		placeholders[i] = "?"
+		args[i] = modelID
+	}
+	if _, e = tx.Exec("DELETE FROM models WHERE model_id NOT IN ("+strings.Join(placeholders, ",")+")", args...); e != nil {
+		_ = tx.Rollback()
+		writeJSON(w, 500, map[string]string{"error": "could not replace model cache"})
+		return
+	}
 	if e = tx.Commit(); e != nil {
 		writeJSON(w, 500, map[string]string{"error": e.Error()})
 		return
@@ -1277,6 +1400,8 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "models were refreshed but refresh metadata could not be saved"})
 		return
 	}
+	a.invalidateUpstreamCache()
+	a.invalidateModelRuntimeCache()
 	writeJSON(w, 200, map[string]any{"ok": true, "free_model_count": free})
 }
 
@@ -1404,10 +1529,15 @@ func priceZero(v any) bool {
 func (a *App) saveRefreshError(s string) {
 	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES('last_model_refresh_error',?)", s); err != nil {
 		log.Printf("save model refresh error failed: %v", err)
+		return
+	}
+	a.invalidateUpstreamCache()
+	if strings.TrimSpace(s) != "" {
+		a.emitAlert("model_refresh_failed", "error", "Model refresh failed", map[string]any{"error": truncateError(s)})
 	}
 }
 func (a *App) listModels(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT id,model_id,display_name,is_free,free_reason,pricing_metadata,raw_metadata,refreshed_at FROM models ORDER BY model_id")
+	rows, err := a.db.Query("SELECT m.id,m.model_id,m.display_name,m.is_free,m.free_reason,m.pricing_metadata,m.raw_metadata,COALESCE(p.enabled,1),m.refreshed_at FROM models m LEFT JOIN model_policies p ON p.model_id=m.model_id ORDER BY m.model_id")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query models"})
 		return
@@ -1421,7 +1551,7 @@ func (a *App) listModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, models)
 }
 func (a *App) listFreeModels(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT id,model_id,display_name,is_free,free_reason,pricing_metadata,raw_metadata,refreshed_at FROM models WHERE is_free=1 ORDER BY model_id")
+	rows, err := a.db.Query("SELECT m.id,m.model_id,m.display_name,m.is_free,m.free_reason,m.pricing_metadata,m.raw_metadata,COALESCE(p.enabled,1),m.refreshed_at FROM models m LEFT JOIN model_policies p ON p.model_id=m.model_id WHERE m.is_free=1 ORDER BY m.model_id")
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query models"})
 		return
@@ -1438,12 +1568,13 @@ func scanModels(rows *sql.Rows) ([]ModelRecord, error) {
 	out := []ModelRecord{}
 	for rows.Next() {
 		var x ModelRecord
-		var free int
+		var free, enabled int
 		var p, raw, ts string
-		if err := rows.Scan(&x.ID, &x.ModelID, &x.DisplayName, &free, &x.FreeReason, &p, &raw, &ts); err != nil {
+		if err := rows.Scan(&x.ID, &x.ModelID, &x.DisplayName, &free, &x.FreeReason, &p, &raw, &enabled, &ts); err != nil {
 			return nil, err
 		}
 		x.IsFree = free == 1
+		x.AdminEnabled = enabled == 1
 		x.Pricing = json.RawMessage(p)
 		x.Raw = json.RawMessage(raw)
 		x.RefreshedAt, _ = time.Parse(time.RFC3339, ts)
@@ -1457,22 +1588,17 @@ func (a *App) gatewayModels(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 401, map[string]string{"error": "invalid client key"})
 		return
 	}
-	rows, err := a.db.Query("SELECT model_id,display_name,raw_metadata FROM models WHERE is_free=1 ORDER BY model_id")
+	models, aliases, err := a.loadModelRuntime()
 	if err != nil {
 		writeJSON(w, 500, map[string]string{"error": "could not query models"})
 		return
 	}
-	defer rows.Close()
 	data := []map[string]any{}
-	for rows.Next() {
-		var id, name, raw string
-		if err := rows.Scan(&id, &name, &raw); err != nil {
-			writeJSON(w, 500, map[string]string{"error": "could not read models"})
-			return
-		}
-		item := map[string]any{"id": id, "object": "model", "owned_by": "opencode-proxy", "name": name}
+	for _, runtimeModel := range modelRuntimeList(models) {
+		model := runtimeModel.Record
+		item := map[string]any{"id": model.ModelID, "object": "model", "owned_by": "opencode-proxy", "name": model.DisplayName}
 		var metadata map[string]any
-		if json.Unmarshal([]byte(raw), &metadata) == nil {
+		if json.Unmarshal(model.Raw, &metadata) == nil {
 			for _, field := range []string{"architecture", "input_modalities", "output_modalities", "supported_parameters"} {
 				if value, ok := metadata[field]; ok {
 					item[field] = value
@@ -1481,9 +1607,16 @@ func (a *App) gatewayModels(w http.ResponseWriter, r *http.Request) {
 		}
 		data = append(data, item)
 	}
-	if err := rows.Err(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not read models"})
-		return
+	aliasNames := make([]string, 0, len(aliases))
+	for alias := range aliases {
+		aliasNames = append(aliasNames, alias)
+	}
+	sort.Strings(aliasNames)
+	for _, alias := range aliasNames {
+		target := aliases[alias]
+		if model, ok := models[target]; ok && model.Record.AdminEnabled {
+			data = append(data, map[string]any{"id": alias, "object": "model", "owned_by": "relaydesk-alias", "name": model.Record.DisplayName + " -> " + target})
+		}
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }
@@ -1522,18 +1655,6 @@ func clientCredential(r *http.Request) string {
 	return supplied
 }
 
-func (a *App) validClient(r *http.Request) bool {
-	supplied := clientCredential(r)
-	var h string
-	if a.db.QueryRow("SELECT value FROM settings WHERE key='client_key'").Scan(&h) != nil {
-		return false
-	}
-	if supplied == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(hashToken(supplied)), []byte(h)) == 1
-}
-
 func sessionKey(r *http.Request, user json.RawMessage) string {
 	sessionID := ""
 	for _, header := range []string{"X-Relay-Session-ID", "X-OpenCode-Session-ID", "X-Session-ID"} {
@@ -1555,10 +1676,15 @@ func sessionKey(r *http.Request, user json.RawMessage) string {
 
 func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	if !a.validClient(r) {
-		writeJSON(w, 401, map[string]string{"error": "invalid client key"})
+	clientKey, authErr := a.authenticateClient(r)
+	if authErr != nil {
+		writeJSON(w, 401, map[string]string{"error": clientKeyError(authErr)})
 		return
 	}
+	if !a.enforceClientLimit(w, clientKey) {
+		return
+	}
+	a.touchClientKey(clientKey)
 	select {
 	case a.gatewaySem <- struct{}{}:
 		defer func() { <-a.gatewaySem }()
@@ -1572,34 +1698,46 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "invalid or oversized body"})
 		return
 	}
-	var parsed struct {
-		Model string          `json:"model"`
-		User  json.RawMessage `json:"user"`
-	}
-	if json.Unmarshal(body, &parsed) != nil || parsed.Model == "" {
+	parsed, requestPayload, parseErr := parseChatEnvelope(body)
+	if parseErr != nil || parsed.Model == "" {
 		writeJSON(w, 400, map[string]string{"error": "model is required"})
 		return
 	}
-	var exists int
-	if err := a.db.QueryRow("SELECT COUNT(*) FROM models WHERE model_id=? AND is_free=1", parsed.Model).Scan(&exists); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not validate model"})
+	requestedModel := parsed.Model
+	resolvedModel, resolveErr := a.resolveModel(requestedModel)
+	if resolveErr != nil {
+		status := http.StatusBadRequest
+		if !strings.Contains(resolveErr.Error(), "not an available") && !strings.Contains(resolveErr.Error(), "not currently") {
+			status = http.StatusInternalServerError
+		}
+		writeJSON(w, status, map[string]string{"error": resolveErr.Error()})
 		return
 	}
-	if exists == 0 {
-		writeJSON(w, 400, map[string]string{"error": "model is not an available free model"})
+	forwardBody := body
+	if resolvedModel != requestedModel {
+		requestPayload["model"] = resolvedModel
+		var rewriteErr error
+		forwardBody, rewriteErr = json.Marshal(requestPayload)
+		if rewriteErr != nil {
+			writeJSON(w, 400, map[string]string{"error": "could not rewrite model request"})
+			return
+		}
+	}
+	cfg, cfgErr := a.loadUpstream()
+	if cfgErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": cfgErr.Error()})
 		return
 	}
-	cfg, _ := a.loadUpstream()
 	if cfg.BaseURL == "" {
 		writeJSON(w, 503, map[string]string{"error": "upstream is not configured"})
 		return
 	}
-	hasImage := requestHasImageInput(body)
+	hasImage := containsImageContentInMessages(parsed.Messages)
 	visionEnabled := hasImage && cfg.VisionBaseURL != "" && cfg.VisionModel != ""
 	if hasImage && !visionEnabled {
-		if known, supportsImage := a.cachedModelSupportsImage(parsed.Model); known && !supportsImage {
-			message := fmt.Sprintf("model %q only supports text input; choose a Free model with image support or remove image_url", parsed.Model)
-			a.recordUsage(parsed.Model, nil, "", "error", http.StatusBadRequest, time.Since(start), nil, 0, nil, errors.New(message))
+		if known, supportsImage := a.cachedModelSupportsImage(resolvedModel); known && !supportsImage {
+			message := fmt.Sprintf("model %q only supports text input; choose a Free model with image support or remove image_url", requestedModel)
+			a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, nil, "", "direct", "error", http.StatusBadRequest, time.Since(start), nil, 0, nil, nil, errors.New(message))
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": message,
 				"code":  "unsupported_input_modality",
@@ -1645,6 +1783,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	lastProxyURI := ""
 	used := map[int64]struct{}{}
+	attemptSummary := []map[string]any{}
 	for i := 0; i < attempts; i++ {
 		var p ProxyRecord
 		if resinMode {
@@ -1666,7 +1805,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			used[p.ID] = struct{}{}
 		}
 		lastProxyURI = p.URI
-		bodyToForward := body
+		bodyToForward := forwardBody
 		if visionEnabled {
 			helperStarted := time.Now()
 			helperProxy := p
@@ -1682,7 +1821,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				helperProxyURI = ""
 				helperRouteEngine = "direct"
 			}
-			helpBody, buildErr := buildVisionRequest(body, cfg.VisionModel)
+			helpBody, buildErr := buildVisionRequestFromMessages(parsed.Messages, cfg.VisionModel)
 			if buildErr != nil {
 				lastErr = buildErr
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", 0, time.Since(helperStarted), nil, i, nil, buildErr)
@@ -1701,7 +1840,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 						a.resinFailure(helpErr)
 						break
 					}
-					a.markProxyFailure(p.ID)
+					if isProxyTransportError(helpErr) {
+						a.markProxyFailure(p.ID)
+					}
 					a.clearSessionProxy(requestSessionKey, p.ID)
 					continue
 				}
@@ -1724,6 +1865,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				lastErr = fmt.Errorf("vision helper response failed: %w", readErr)
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
 				if cfg.VisionUseProxy {
+					if !resinMode && isProxyTransportError(readErr) {
+						a.markProxyFailure(p.ID)
+						a.clearSessionProxy(requestSessionKey, p.ID)
+					}
 					continue
 				}
 				break
@@ -1751,7 +1896,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
 				break
 			}
-			bodyToForward, buildErr = replaceImageContent(body, description)
+			workingPayload, cloneErr := cloneJSONValue(requestPayload).(map[string]any)
+			if !cloneErr {
+				buildErr = errors.New("could not clone image request")
+			} else {
+				bodyToForward, buildErr = replaceImageContentPayload(workingPayload, description)
+			}
 			if buildErr != nil {
 				lastErr = buildErr
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
@@ -1762,31 +1912,53 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		resp, e := a.forward(r, bodyToForward, cfg, p)
 		if e != nil {
 			lastErr = e
+			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
 			if resinMode {
 				a.resinFailure(e)
 				break
 			}
-			a.markProxyFailure(p.ID)
+			if isProxyTransportError(e) {
+				a.markProxyFailure(p.ID)
+			}
 			a.clearSessionProxy(requestSessionKey, p.ID)
 			continue
 		}
 		if resinMode {
 			a.resinSuccess()
-		} else {
+		} else if resp.StatusCode == http.StatusProxyAuthRequired {
+			a.markProxyFailure(p.ID)
+			a.clearSessionProxy(requestSessionKey, p.ID)
+		} else if resp.StatusCode < 500 {
 			a.markProxySuccess(p.ID)
 		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			if resinMode {
-				if advanceErr := a.advanceResinAccount(requestSessionKey); advanceErr != nil {
-					log.Printf("advance Resin account failed: %v", advanceErr)
-				}
-			} else {
-				a.clearSessionProxy(requestSessionKey, p.ID)
-			}
-		}
-		if resp.StatusCode == http.StatusTooManyRequests && i+1 < attempts {
+		if resp.StatusCode == http.StatusProxyAuthRequired && !resinMode {
+			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "error": "proxy authentication failed", "latency_ms": time.Since(start).Milliseconds()})
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
+			lastErr = errors.New("proxy authentication failed")
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && resinMode {
+			if advanceErr := a.advanceResinAccount(requestSessionKey); advanceErr != nil {
+				log.Printf("advance Resin account failed: %v", advanceErr)
+			}
+			if i+1 < attempts {
+				attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				_ = resp.Body.Close()
+				continue
+			}
+		} else if resp.StatusCode == http.StatusTooManyRequests {
+			a.clearSessionProxy(requestSessionKey, p.ID)
+		}
+		if retryableUpstreamStatus(resp.StatusCode) && i+1 < attempts && !resinMode {
+			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			_ = resp.Body.Close()
+			if !waitForRetry(r.Context(), retryAfterDelay(resp, i)) {
+				lastErr = r.Context().Err()
+				break
+			}
 			continue
 		}
 		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start)
@@ -1806,10 +1978,11 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if copyErr != nil {
 			requestError = errors.Join(requestError, copyErr)
 		}
-		a.recordUsageWithEngine(parsed.Model, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, requestError)
+		attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
+		a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, requestError)
 		return
 	}
-	a.recordUsageWithEngine(parsed.Model, nil, lastProxyURI, routeEngine, "error", 502, time.Since(start), nil, attempts, nil, lastErr)
+	a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", 502, time.Since(start), nil, attempts, nil, attemptSummary, lastErr)
 	writeJSON(w, 502, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
 }
 func lastErrString(e error) string {
@@ -1847,6 +2020,13 @@ func buildVisionRequest(body []byte, visionModel string) ([]byte, error) {
 	if !ok || len(messages) == 0 {
 		return nil, errors.New("image input requires chat messages")
 	}
+	return buildVisionRequestFromMessages(messages, visionModel)
+}
+
+func buildVisionRequestFromMessages(messages []any, visionModel string) ([]byte, error) {
+	if len(messages) == 0 {
+		return nil, errors.New("image input requires chat messages")
+	}
 	helperMessages := make([]any, 0, len(messages)+1)
 	helperMessages = append(helperMessages, map[string]any{
 		"role":    "system",
@@ -1860,6 +2040,25 @@ func buildVisionRequest(body []byte, visionModel string) ([]byte, error) {
 		"stream":     false,
 	}
 	return json.Marshal(helperPayload)
+}
+
+func cloneJSONValue(value any) any {
+	switch item := value.(type) {
+	case map[string]any:
+		copyMap := make(map[string]any, len(item))
+		for key, nested := range item {
+			copyMap[key] = cloneJSONValue(nested)
+		}
+		return copyMap
+	case []any:
+		copySlice := make([]any, len(item))
+		for i, nested := range item {
+			copySlice[i] = cloneJSONValue(nested)
+		}
+		return copySlice
+	default:
+		return value
+	}
 }
 
 func extractVisionDescription(body []byte) (string, error) {
@@ -1915,6 +2114,10 @@ func replaceImageContent(body []byte, description string) ([]byte, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("could not rewrite image content: %w", err)
 	}
+	return replaceImageContentPayload(payload, description)
+}
+
+func replaceImageContentPayload(payload map[string]any, description string) ([]byte, error) {
 	messages, ok := payload["messages"].([]any)
 	if !ok {
 		return nil, errors.New("image input requires chat messages")
@@ -1990,16 +2193,24 @@ func addTokenValue(first, second *int64) *int64 {
 }
 
 func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
+	a.initializeRuntimeServices()
+	return a.proxyRuntime.clientFor(a, p)
+}
+
+func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, *http.Transport, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 256
+	tr.MaxIdleConnsPerHost = 32
+	tr.IdleConnTimeout = 90 * time.Second
 	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	tr.ResponseHeaderTimeout = upstreamRequestTimeout
 	if strings.TrimSpace(p.URI) == "" {
 		tr.Proxy = nil
-		return &http.Client{Transport: tr}, nil
+		return &http.Client{Transport: tr}, tr, nil
 	}
 	u, err := url.Parse(p.URI)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if u.Scheme == "socks5" || u.Scheme == "socks5h" {
 		var auth *proxy.Auth
@@ -2008,7 +2219,7 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 		}
 		d, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		tr.Proxy = nil
 		tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -2023,7 +2234,7 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 		}
 		tr.Proxy = http.ProxyURL(u)
 	}
-	return &http.Client{Transport: tr}, nil
+	return &http.Client{Transport: tr}, tr, nil
 }
 func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time) (*tokenUsage, string, *time.Duration, error) {
 	defer resp.Body.Close()
@@ -2236,6 +2447,10 @@ func requestHasImageInput(body []byte) bool {
 	if !ok {
 		return false
 	}
+	return containsImageContentInMessages(messages)
+}
+
+func containsImageContentInMessages(messages []any) bool {
 	for _, rawMessage := range messages {
 		message, ok := rawMessage.(map[string]any)
 		if !ok {
@@ -2280,11 +2495,15 @@ func isImageContentPart(value any) bool {
 }
 
 func (a *App) cachedModelSupportsImage(model string) (known, supported bool) {
-	var raw string
-	if err := a.db.QueryRow("SELECT raw_metadata FROM models WHERE model_id=? AND is_free=1", model).Scan(&raw); err != nil {
+	models, _, err := a.loadModelRuntime()
+	if err != nil {
 		return false, false
 	}
-	return modelImageSupport([]byte(raw))
+	entry, ok := models[model]
+	if !ok {
+		return false, false
+	}
+	return entry.ImageKnown, entry.SupportsImages
 }
 
 func modelImageSupport(raw []byte) (known, supported bool) {
@@ -2403,6 +2622,11 @@ func usageNumber(v any) *int64 {
 }
 
 func (a *App) availableProxies() ([]ProxyRecord, error) {
+	a.initializeRuntimeServices()
+	return a.proxyRuntime.available(a)
+}
+
+func (a *App) loadAvailableProxiesFromDB() ([]ProxyRecord, error) {
 	a.deleteExpiredProxies()
 	a.deleteStaleSessionRoutes()
 	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),created_at FROM proxies WHERE enabled=1 ORDER BY id")
@@ -2443,9 +2667,49 @@ func (a *App) availableProxies() ([]ProxyRecord, error) {
 	return out, rows.Err()
 }
 
+// loadProxiesForProbe deliberately includes cooling proxies. A successful
+// scheduled or manual exit probe is the signal that clears their cooldown.
+func (a *App) loadProxiesForProbeFromDB() ([]ProxyRecord, error) {
+	a.deleteExpiredProxies()
+	rows, err := a.db.Query("SELECT id,uri,scheme,host,port,COALESCE(username,''),COALESCE(encrypted_password,''),enabled,health_status,failure_count,COALESCE(cooldown_until,''),COALESCE(expires_at,''),created_at FROM proxies WHERE enabled=1 ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ProxyRecord{}
+	for rows.Next() {
+		var p ProxyRecord
+		var enabled int
+		var cooldown, expires, created, encrypted string
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &enabled, &p.HealthStatus, &p.FailureCount, &cooldown, &expires, &created); err != nil {
+			return nil, err
+		}
+		password, decryptErr := a.decrypt(encrypted)
+		if decryptErr != nil {
+			return nil, fmt.Errorf("could not decrypt proxy %d credentials: %w", p.ID, decryptErr)
+		}
+		p.Password = password
+		p.Enabled = enabled == 1
+		p.CreatedAt, _ = time.Parse(time.RFC3339, created)
+		p.CooldownUntil = parseStoredTime(cooldown)
+		p.ExpiresAt = parseStoredTime(expires)
+		if p.ExpiresAt != nil && !p.ExpiresAt.After(time.Now().UTC()) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (a *App) deleteExpiredProxies() {
-	if _, err := a.db.Exec("DELETE FROM proxies WHERE expires_at IS NOT NULL AND expires_at <> '' AND expires_at <= ?", time.Now().UTC().Format(time.RFC3339)); err != nil {
+	result, err := a.db.Exec("DELETE FROM proxies WHERE expires_at IS NOT NULL AND expires_at <> '' AND expires_at <= ?", time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
 		log.Printf("delete expired proxies failed: %v", err)
+		return
+	}
+	if deleted, _ := result.RowsAffected(); deleted > 0 {
+		a.initializeRuntimeServices()
+		a.proxyRuntime.invalidate()
 	}
 }
 
@@ -2469,12 +2733,47 @@ func (a *App) expiredProxyJanitor() {
 		if err := a.deleteExpiredAdminSessions(); err != nil {
 			log.Printf("delete expired admin sessions failed: %v", err)
 		}
+		if _, err := a.db.Exec("DELETE FROM alert_events WHERE status IN ('delivered','failed') AND created_at<?", time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339)); err != nil {
+			log.Printf("delete expired alert events failed: %v", err)
+		}
+		if _, err := a.db.Exec("DELETE FROM proxy_probe_jobs WHERE expires_at<=?", time.Now().UTC().Format(time.RFC3339)); err != nil {
+			log.Printf("delete expired probe jobs failed: %v", err)
+		}
+		if _, err := a.db.Exec("DELETE FROM proxy_probe_results WHERE job_id NOT IN (SELECT id FROM proxy_probe_jobs)"); err != nil {
+			log.Printf("delete expired probe results failed: %v", err)
+		}
 	}
 }
 
+func (a *App) alertEvaluationJanitor() {
+	a.evaluateAlertConditions()
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		a.evaluateAlertConditions()
+	}
+}
+
+func (a *App) evaluateAlertConditions() {
+	now := time.Now().UTC()
+	engine, err := a.proxyEngineStatus()
+	if err != nil {
+		return
+	}
+	var active int64
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM proxies WHERE enabled=1 AND (cooldown_until IS NULL OR cooldown_until='' OR cooldown_until<=?) AND (expires_at IS NULL OR expires_at='' OR expires_at>?)", now.Format(time.RFC3339), now.Format(time.RFC3339)).Scan(&active); err != nil {
+		return
+	}
+	a.evaluateGatewayAlerts(now, engine, active)
+}
+
 func (a *App) pickSessionProxy(key string, proxies []ProxyRecord, used map[int64]struct{}) (ProxyRecord, bool, error) {
-	a.routingMu.Lock()
-	defer a.routingMu.Unlock()
+	var routeLock *sync.Mutex
+	if key != "" {
+		routeLock = &a.routingLocks[sessionRouteLockIndex(key)]
+		routeLock.Lock()
+		defer routeLock.Unlock()
+	}
 	if key != "" {
 		limit := a.sessionProxyRequestLimit()
 		var currentID int64
@@ -2518,19 +2817,39 @@ func (a *App) clearSessionProxy(key string, proxyID int64) {
 	if key == "" {
 		return
 	}
+	lock := &a.routingLocks[sessionRouteLockIndex(key)]
+	lock.Lock()
+	defer lock.Unlock()
 	if _, err := a.db.Exec("DELETE FROM session_proxy_routes WHERE session_key=? AND proxy_id=?", key, proxyID); err != nil {
 		log.Printf("clear session proxy failed: %v", err)
 	}
 }
 func (a *App) markProxyFailure(id int64) {
-	if _, err := a.db.Exec("UPDATE proxies SET health_status='cooldown',failure_count=failure_count+1,cooldown_until=?,updated_at=? WHERE id=?", time.Now().Add(time.Minute).UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), id); err != nil {
-		log.Printf("mark proxy failure failed: %v", err)
+	var previous int
+	if err := a.db.QueryRow("SELECT failure_count FROM proxies WHERE id=?", id).Scan(&previous); err != nil {
+		log.Printf("load proxy failure count failed: %v", err)
+		return
 	}
+	failures := previous + 1
+	delay := time.Minute * time.Duration(1<<min(failures-1, 5))
+	if delay > 30*time.Minute {
+		delay = 30 * time.Minute
+	}
+	cooldown := time.Now().UTC().Add(delay)
+	if _, err := a.db.Exec("UPDATE proxies SET health_status='cooldown',failure_count=?,cooldown_until=?,updated_at=? WHERE id=?", failures, cooldown.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339), id); err != nil {
+		log.Printf("mark proxy failure failed: %v", err)
+		return
+	}
+	a.initializeRuntimeServices()
+	a.proxyRuntime.replaceHealth(id, "cooldown", failures, &cooldown)
 }
 func (a *App) markProxySuccess(id int64) {
 	if _, err := a.db.Exec("UPDATE proxies SET health_status='healthy',failure_count=0,cooldown_until=NULL,updated_at=? WHERE id=?", time.Now().UTC().Format(time.RFC3339), id); err != nil {
 		log.Printf("mark proxy success failed: %v", err)
+		return
 	}
+	a.initializeRuntimeServices()
+	a.proxyRuntime.replaceHealth(id, "healthy", 0, nil)
 }
 
 func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
@@ -2622,7 +2941,7 @@ func (a *App) listProxies(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-const proxySelect = "SELECT p.id,p.uri,p.scheme,p.host,p.port,COALESCE(p.username,''),COALESCE(p.encrypted_password,''),p.enabled,p.health_status,p.failure_count,COALESCE(p.cooldown_until,''),COALESCE(p.expires_at,''),p.created_at FROM proxies p"
+const proxySelect = "SELECT p.id,p.uri,p.scheme,p.host,p.port,COALESCE(p.username,''),COALESCE(p.encrypted_password,''),p.enabled,p.health_status,p.failure_count,COALESCE(p.cooldown_until,''),COALESCE(p.expires_at,''),COALESCE(p.last_probe_at,''),p.last_probe_latency_ms,COALESCE(p.last_exit_ip,''),COALESCE(p.last_probe_error,''),COALESCE(p.upstream_probe_at,''),COALESCE(p.upstream_probe_status,''),p.created_at FROM proxies p"
 
 func proxyFilterClause(state string, now time.Time) (string, []any, bool) {
 	nowText := now.Format(time.RFC3339)
@@ -2695,8 +3014,9 @@ func scanProxies(rows *sql.Rows) ([]ProxyRecord, error) {
 	for rows.Next() {
 		var p ProxyRecord
 		var en int
-		var cool, expires, created, encrypted string
-		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &created); err != nil {
+		var cool, expires, lastProbe, lastUpstream, created, encrypted string
+		var lastLatency sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.URI, &p.Scheme, &p.Host, &p.Port, &p.Username, &encrypted, &en, &p.HealthStatus, &p.FailureCount, &cool, &expires, &lastProbe, &lastLatency, &p.LastExitIP, &p.LastProbeError, &lastUpstream, &p.UpstreamProbeStatus, &created); err != nil {
 			return nil, err
 		}
 		p.Enabled = en == 1
@@ -2708,6 +3028,12 @@ func scanProxies(rows *sql.Rows) ([]ProxyRecord, error) {
 		if expires != "" {
 			t, _ := time.Parse(time.RFC3339, expires)
 			p.ExpiresAt = &t
+		}
+		p.LastProbeAt = parseStoredTime(lastProbe)
+		p.UpstreamProbeAt = parseStoredTime(lastUpstream)
+		if lastLatency.Valid {
+			latency := lastLatency.Int64
+			p.LastProbeMS = &latency
 		}
 		out = append(out, p)
 	}
@@ -2882,7 +3208,12 @@ func (a *App) insertProxy(p ProxyRecord) (int64, error) {
 	if e != nil {
 		return 0, e
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err == nil {
+		a.initializeRuntimeServices()
+		a.proxyRuntime.invalidate()
+	}
+	return id, err
 }
 func (a *App) proxyID(r *http.Request) (int64, error) {
 	return strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -2914,6 +3245,8 @@ func (a *App) patchProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "proxy not found"})
 		return
 	}
+	a.initializeRuntimeServices()
+	a.proxyRuntime.invalidate()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *App) deleteProxy(w http.ResponseWriter, r *http.Request) {
@@ -2932,6 +3265,8 @@ func (a *App) deleteProxy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "proxy not found"})
 		return
 	}
+	a.initializeRuntimeServices()
+	a.proxyRuntime.invalidate()
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -2977,6 +3312,8 @@ func (a *App) bulkDeleteProxies(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not delete proxies"})
 		return
 	}
+	a.initializeRuntimeServices()
+	a.proxyRuntime.invalidate()
 	writeJSON(w, 200, map[string]any{"ok": true, "deleted": deleted})
 }
 
@@ -3111,7 +3448,7 @@ func usageErrorOrigin(kind, status string, code int, message string) string {
 }
 
 const usageOriginSQL = "COALESCE(NULLIF(u.error_origin,''),'user')"
-const usageSelect = "SELECT u.id,u.created_at,COALESCE(u.request_kind,'chat'),u.model,u.proxy_id,COALESCE(NULLIF(u.proxy_uri,''),p.uri,''),u.status,u.status_code,u.latency_ms,u.first_token_latency_ms,u.retry_count,u.prompt_tokens,u.completion_tokens,u.total_tokens,COALESCE(u.error_message,'')," + usageOriginSQL + ",COALESCE(NULLIF(u.route_engine,''),'builtin') FROM usage_requests u LEFT JOIN proxies p ON p.id=u.proxy_id"
+const usageSelect = "SELECT u.id,u.created_at,COALESCE(u.request_kind,'chat'),u.model,COALESCE(u.resolved_model,''),u.client_key_id,COALESCE(u.client_key_name,''),u.proxy_id,COALESCE(NULLIF(u.proxy_uri,''),p.uri,''),u.status,u.status_code,u.latency_ms,u.first_token_latency_ms,u.retry_count,u.prompt_tokens,u.completion_tokens,u.total_tokens,COALESCE(u.error_message,'')," + usageOriginSQL + ",COALESCE(NULLIF(u.route_engine,''),'builtin'),COALESCE(u.attempt_summary,'') FROM usage_requests u LEFT JOIN proxies p ON p.id=u.proxy_id"
 
 func (a *App) usageList(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
@@ -3248,11 +3585,14 @@ func (a *App) queryUsageRequests(query string, args ...any) ([]usageRequest, err
 	out := []usageRequest{}
 	for rows.Next() {
 		var x usageRequest
-		var ts string
-		if err := rows.Scan(&x.ID, &ts, &x.RequestKind, &x.Model, &x.ProxyID, &x.ProxyURI, &x.Status, &x.StatusCode, &x.LatencyMS, &x.FirstTokenLatencyMS, &x.RetryCount, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.ErrorMessage, &x.ErrorOrigin, &x.RouteEngine); err != nil {
+		var ts, attempts string
+		if err := rows.Scan(&x.ID, &ts, &x.RequestKind, &x.Model, &x.ResolvedModel, &x.ClientKeyID, &x.ClientKeyName, &x.ProxyID, &x.ProxyURI, &x.Status, &x.StatusCode, &x.LatencyMS, &x.FirstTokenLatencyMS, &x.RetryCount, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.ErrorMessage, &x.ErrorOrigin, &x.RouteEngine, &attempts); err != nil {
 			return nil, err
 		}
 		x.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+		if attempts != "" {
+			x.AttemptSummary = json.RawMessage(attempts)
+		}
 		out = append(out, x)
 	}
 	if err := rows.Err(); err != nil {
@@ -3311,8 +3651,8 @@ func (a *App) statsSummary(w http.ResponseWriter, _ *http.Request) {
 		{"SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND COALESCE(NULLIF(error_origin,''),'user')<>'external'", nil, []any{&counted}},
 		{"SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND COALESCE(NULLIF(error_origin,''),'user')='external'", nil, []any{&external}},
 		{"SELECT COALESCE(SUM(prompt_tokens),0),COALESCE(SUM(completion_tokens),0),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE request_kind='chat' AND created_at>=? AND created_at<=?", []any{dayStart, now.Format(time.RFC3339)}, []any{&pt, &ct, &tt}},
-		{"SELECT COUNT(*) FROM models WHERE is_free=1", nil, []any{&free}},
-		{"SELECT COUNT(*) FROM proxies WHERE enabled=1", nil, []any{&active}},
+		{"SELECT COUNT(*) FROM models m LEFT JOIN model_policies p ON p.model_id=m.model_id WHERE m.is_free=1 AND COALESCE(p.enabled,1)=1", nil, []any{&free}},
+		{"SELECT COUNT(*) FROM proxies WHERE enabled=1 AND (cooldown_until IS NULL OR cooldown_until='' OR cooldown_until<=?) AND (expires_at IS NULL OR expires_at='' OR expires_at>?)", []any{now.Format(time.RFC3339), now.Format(time.RFC3339)}, []any{&active}},
 	}
 	for _, query := range queries {
 		if err := a.db.QueryRow(query.query, query.args...).Scan(query.dest...); err != nil {
@@ -3325,7 +3665,31 @@ func (a *App) statsSummary(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, 500, map[string]string{"error": "could not load proxy engine status"})
 		return
 	}
+	a.evaluateGatewayAlerts(now, engine, active)
 	writeJSON(w, 200, map[string]any{"requests": total, "counted_requests": counted, "external_requests": external, "success": success, "success_rate": rate(success, counted), "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt, "free_models": free, "active_proxies": active, "proxy_engine": engine.Engine, "effective_proxy_engine": engine.EffectiveEngine, "resin_fallback_active": engine.ResinFallbackActive, "resin_fallback_since": engine.ResinFallbackSince, "resin_fallback_reason": engine.ResinFallbackReason})
+}
+
+func (a *App) evaluateGatewayAlerts(now time.Time, engine proxyEngineStatus, active int64) {
+	if engine.Engine == proxyEngineBuiltin {
+		if active == 0 {
+			a.emitAlert("proxy_pool_empty", "error", "No routable proxies are available", nil)
+		} else if settings, _, err := a.loadAlertSettings(); err == nil && active < int64(settings.LowProxyThreshold) {
+			a.emitAlert("proxy_availability_low", "warning", "Proxy availability is below the configured threshold", map[string]any{"available_proxies": active})
+		}
+	}
+	var recentCount, recentSuccess int64
+	fiveMinutesAgo := now.Add(-5 * time.Minute).Format(time.RFC3339)
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND created_at>=? AND COALESCE(NULLIF(error_origin,''),'user')<>'external'", fiveMinutesAgo).Scan(&recentCount); err != nil {
+		return
+	}
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM usage_requests WHERE request_kind='chat' AND created_at>=? AND status='success'", fiveMinutesAgo).Scan(&recentSuccess); err != nil {
+		return
+	}
+	if recentCount >= 20 {
+		if settings, _, err := a.loadAlertSettings(); err == nil && rate(recentSuccess, recentCount)*100 < float64(settings.SuccessRatePercent) {
+			a.emitAlert("success_rate_low", "warning", "Gateway success rate is below the configured threshold", map[string]any{"success_rate": rate(recentSuccess, recentCount) * 100, "requests": recentCount, "window": "5m"})
+		}
+	}
 }
 
 func chinaDayStart(now time.Time) time.Time {
@@ -3362,28 +3726,8 @@ func (a *App) statsTimeseries(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, 200, out)
 }
-func (a *App) statsModels(w http.ResponseWriter, _ *http.Request) {
-	rows, err := a.db.Query("SELECT model,COUNT(*),COALESCE(SUM(total_tokens),0) FROM usage_requests WHERE request_kind='chat' GROUP BY model ORDER BY COUNT(*) DESC")
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not query model statistics"})
-		return
-	}
-	defer rows.Close()
-	out := []map[string]any{}
-	for rows.Next() {
-		var m string
-		var n, t int64
-		if err := rows.Scan(&m, &n, &t); err != nil {
-			writeJSON(w, 500, map[string]string{"error": "could not read model statistics"})
-			return
-		}
-		out = append(out, map[string]any{"model": m, "requests": n, "tokens": t})
-	}
-	if err := rows.Err(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "could not read model statistics"})
-		return
-	}
-	writeJSON(w, 200, out)
+func (a *App) statsModels(w http.ResponseWriter, r *http.Request) {
+	a.statsByDimension(w, r, "model")
 }
 
 func (a *App) encrypt(s string) (string, error) {

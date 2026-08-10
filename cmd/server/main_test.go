@@ -20,7 +20,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-func testApp(t *testing.T) *App {
+func testApp(t testing.TB) *App {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:test-"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared")
 	if err != nil {

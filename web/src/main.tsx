@@ -16,12 +16,15 @@ import {
   KeyRound,
   LogOut,
   Network,
+  Radio,
   RefreshCw,
   Server,
   Settings2,
   ShieldCheck,
+  TriangleAlert,
   Trash2,
   Upload,
+  UsersRound,
   X,
 } from "lucide-react";
 import "./styles.css";
@@ -57,6 +60,12 @@ type Proxy = {
   usage_state?: "unused" | "in_use" | "cooldown";
   cooldown_until?: string;
   expires_at?: string;
+  last_probe_at?: string;
+  last_probe_latency_ms?: number;
+  last_exit_ip?: string;
+  last_probe_error?: string;
+  upstream_probe_at?: string;
+  upstream_probe_status?: string;
 };
 type ProxyPage = {
   items: Proxy[];
@@ -72,6 +81,7 @@ type Model = {
   is_free: boolean;
   free_reason: string;
   refreshed_at: string;
+  admin_enabled?: boolean;
 };
 type RequestRow = {
   id: number;
@@ -103,7 +113,43 @@ type ProxyEngine = {
   resin_fallback_reason?: string;
   resin_last_checked_at?: string;
   resin_last_check_error?: string;
+  resin_health?: "unknown" | "healthy" | "degraded";
 };
+type ToastType = "success" | "warning" | "error";
+type Toast = { message: string; type: ToastType };
+type ImportResult = { line: number; uri: string; status: string; error?: string };
+type ClientKey = {
+  id: number;
+  name: string;
+  hint: string;
+  enabled: boolean;
+  expires_at?: string;
+  rpm_limit: number;
+  tpm_limit: number;
+  last_used_at?: string;
+};
+type ModelAlias = {
+  id: number;
+  alias: string;
+  target_model_id: string;
+  enabled: boolean;
+};
+type ProbeJob = {
+  id: string;
+  status: string;
+  total: number;
+  completed: number;
+  results: Array<{ proxy_id: number; uri: string; exit_ok: boolean; exit_ip?: string; error?: string }>;
+};
+type AlertSettings = {
+  enabled: boolean;
+  webhook_url: string;
+  has_webhook_secret: boolean;
+  events: string[];
+  low_proxy_threshold: number;
+  success_rate_percent: number;
+};
+type ProbeSettings = { enabled: boolean; exit_minutes: number; upstream_minutes: number };
 type UsagePage = {
   items: RequestRow[];
   page: number;
@@ -123,8 +169,22 @@ type DailyUsage = {
   requests: number;
   tokens: number;
 };
+type DimensionStat = {
+  name: string;
+  requests: number;
+  success: number;
+  external_errors: number;
+  user_errors: number;
+  tokens: number;
+  success_rate: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  p50_first_token_latency_ms: number;
+  p95_first_token_latency_ms: number;
+};
 type ProxyFilterState = "all" | "unused" | "in_use" | "cooldown";
 type UsageTimePreset = "all" | "1h" | "24h" | "7d" | "30d" | "custom";
+type StatsWindow = "1h" | "24h" | "7d" | "30d";
 type UsageFilters = {
   time: UsageTimePreset;
   model: string;
@@ -133,13 +193,25 @@ type UsageFilters = {
   customTo: string;
 };
 
+const alertEventOptions = [
+  { value: "resin_unavailable", label: "Resin 不可达" },
+  { value: "proxy_availability_low", label: "可用代理低于阈值" },
+  { value: "proxy_pool_empty", label: "代理池为空" },
+  { value: "success_rate_low", label: "5 分钟成功率过低" },
+  { value: "model_refresh_failed", label: "模型刷新失败" },
+  { value: "client_key_rate_limited", label: "客户端 Key 限流" },
+];
+
 const api = async (path: string, init: RequestInit = {}) => {
   const r = await fetch(path, {
     credentials: "include",
     headers: { "Content-Type": "application/json", ...(init.headers || {}) },
     ...init,
   });
-  if (r.status === 401) throw new Error("AUTH");
+  if (r.status === 401) {
+    window.dispatchEvent(new Event("relaydesk:auth-expired"));
+    throw new Error("AUTH");
+  }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || "请求失败");
   return data;
@@ -221,16 +293,32 @@ function Login({ onLogin }: { onLogin: () => void }) {
 
 function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
-  const [page, setPage] = useState("overview");
-  const [toast, setToast] = useState("");
+  const [page, setPage] = useState(() => {
+    const view = new URLSearchParams(location.search).get("view");
+    return ["overview", "proxies", "models", "usage", "settings"].includes(view || "") ? view! : "overview";
+  });
+  const [toast, setToast] = useState<Toast | null>(null);
   useEffect(() => {
     api("/api/auth/me")
       .then(() => setAuthed(true))
       .catch(() => setAuthed(false));
   }, []);
   useEffect(() => {
+    const expire = () => setAuthed(false);
+    window.addEventListener("relaydesk:auth-expired", expire);
+    return () => window.removeEventListener("relaydesk:auth-expired", expire);
+  }, []);
+  useEffect(() => {
+    const syncPageFromURL = () => {
+      const view = new URLSearchParams(location.search).get("view");
+      setPage(["overview", "proxies", "models", "usage", "settings"].includes(view || "") ? view! : "overview");
+    };
+    window.addEventListener("popstate", syncPageFromURL);
+    return () => window.removeEventListener("popstate", syncPageFromURL);
+  }, []);
+  useEffect(() => {
     if (toast) {
-      const t = setTimeout(() => setToast(""), 2600);
+      const t = setTimeout(() => setToast(null), 3000);
       return () => clearTimeout(t);
     }
   }, [toast]);
@@ -242,11 +330,17 @@ function App() {
       </div>
     );
   if (!authed) return <Login onLogin={() => setAuthed(true)} />;
+  const selectPage = (next: string) => {
+    const url = new URL(location.href);
+    url.searchParams.set("view", next);
+    history.pushState(null, "", url);
+    setPage(next);
+  };
   return (
     <Console
       page={page}
-      setPage={setPage}
-      notify={setToast}
+      setPage={selectPage}
+      notify={(message, type = "success") => setToast({ message, type })}
       onLogout={() => {
         api("/api/auth/logout", { method: "POST" }).finally(() =>
           setAuthed(false),
@@ -266,9 +360,9 @@ function Console({
 }: {
   page: string;
   setPage: (v: string) => void;
-  notify: (v: string) => void;
+  notify: (v: string, type?: ToastType) => void;
   onLogout: () => void;
-  toast: string;
+  toast: Toast | null;
 }) {
   const [summary, setSummary] = useState<Summary>({
     requests: 0,
@@ -287,25 +381,42 @@ function Console({
   const [upstream, setUpstream] = useState<any>({});
   const [proxyRefreshToken, setProxyRefreshToken] = useState(0);
   const [usageRefreshToken, setUsageRefreshToken] = useState(0);
-  const load = async () => {
-    try {
-      const [s, m, r, u] = await Promise.all([
-        api("/api/stats/summary"),
-        api("/api/models/free"),
-        api("/api/usage/requests?limit=25"),
-        api("/api/settings/upstream"),
-      ]);
-      setSummary(s);
-      setModels(m);
-      setRows(r);
-      setUpstream(u);
-    } catch (e) {
-      if ((e as Error).message === "AUTH") onLogout();
+  const load = useCallback(async () => {
+    const results = await Promise.allSettled([
+      api("/api/stats/summary"),
+      api("/api/models/free"),
+      api("/api/usage/requests?limit=25"),
+      api("/api/settings/upstream"),
+    ]);
+    const [summaryResult, modelsResult, usageResult, upstreamResult] = results;
+    if (summaryResult.status === "fulfilled") setSummary(summaryResult.value);
+    if (modelsResult.status === "fulfilled") setModels(modelsResult.value);
+    if (usageResult.status === "fulfilled") setRows(usageResult.value);
+    if (upstreamResult.status === "fulfilled") setUpstream(upstreamResult.value);
+    const errors = results.filter((result) => result.status === "rejected") as PromiseRejectedResult[];
+    if (errors.some((result) => (result.reason as Error).message === "AUTH")) {
+      onLogout();
+      return false;
+    } else if (errors.length) {
+      notify("部分控制台数据未能刷新", "warning");
+      return false;
     }
-  };
+    return true;
+  }, [notify, onLogout]);
   useEffect(() => {
-    load();
-  }, []);
+    void load();
+  }, [load]);
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (page === "overview" && document.visibilityState === "visible") void load();
+    };
+    const timer = window.setInterval(refreshWhenVisible, 10_000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [load, page]);
   const nav = [
     ["overview", "Overview", "仪表盘", CircleGauge],
     ["proxies", "Proxy pool", "代理池", Network],
@@ -367,11 +478,11 @@ function Console({
             <button
               className="icon-btn"
               title="刷新数据"
-              onClick={() => {
-                load();
+              onClick={async () => {
+                const refreshed = await load();
                 setProxyRefreshToken((current) => current + 1);
                 setUsageRefreshToken((current) => current + 1);
-                notify("数据已刷新");
+                if (refreshed) notify("数据已刷新");
               }}
             >
               <RefreshCw size={17} />
@@ -408,9 +519,9 @@ function Console({
           <SettingsPage notify={notify} onLogout={onLogout} />
         )}{" "}
         {toast && (
-          <div className="toast">
-            <Check size={15} />
-            {toast}
+          <div className={`toast ${toast.type}`}>
+            {toast.type === "success" ? <Check size={15} /> : <TriangleAlert size={15} />}
+            {toast.message}
           </div>
         )}
       </main>
@@ -453,6 +564,7 @@ function Overview({
 }) {
   const success = summary.success_rate * 100;
   const countedRequests = summary.counted_requests || summary.requests;
+	const enabledModels = models.filter((model) => model.admin_enabled !== false);
   return (
     <div className="page">
       <section className="hero-band">
@@ -476,20 +588,6 @@ function Overview({
           </div>
         </div>
       </section>
-      {summary.resin_fallback_active && (
-        <section className="resin-warning" role="alert">
-          <div>
-            <span className="eyebrow">RESIN DEGRADED</span>
-            <strong>Resin is unavailable. New requests use the built-in pool.</strong>
-            {summary.resin_fallback_reason && (
-              <small>{summary.resin_fallback_reason}</small>
-            )}
-          </div>
-          {summary.resin_fallback_since && (
-            <time>{new Date(summary.resin_fallback_since).toLocaleString()}</time>
-          )}
-        </section>
-      )}
       <section className="stat-grid">
         <Stat
           label="总请求数"
@@ -522,6 +620,7 @@ function Overview({
           accent="#6d8b75"
         />
       </section>
+      <DashboardStatistics />
       <section className="two-col">
         <div className="panel">
           <div className="panel-head">
@@ -529,13 +628,13 @@ function Overview({
               <span className="eyebrow">路由概览</span>
               <h3>免费模型</h3>
             </div>
-            <span className="count-chip">{models.length} 个可用</span>
+            <span className="count-chip">{enabledModels.length} 个可用</span>
           </div>
-          {models.length === 0 ? (
+          {enabledModels.length === 0 ? (
             <Empty text="还没有可用的 Free 模型" />
           ) : (
             <div className="model-list">
-              {models.slice(0, 6).map((m) => (
+              {enabledModels.slice(0, 6).map((m) => (
                 <div className="model-row" key={m.model_id}>
                   <span className="model-swatch">✦</span>
                   <div>
@@ -586,6 +685,85 @@ function Overview({
   );
 }
 
+const statsWindows: Array<{ value: StatsWindow; label: string }> = [
+  { value: "1h", label: "1 小时" },
+  { value: "24h", label: "24 小时" },
+  { value: "7d", label: "7 天" },
+  { value: "30d", label: "30 天" },
+];
+
+function DashboardStatistics() {
+  const initialWindow = new URLSearchParams(location.search).get("stats_window");
+  const [windowName, setWindowName] = useState<StatsWindow>(
+    statsWindows.some((option) => option.value === initialWindow) ? initialWindow as StatsWindow : "24h",
+  );
+  const [modelStats, setModelStats] = useState<DimensionStat[]>([]);
+  const [proxyStats, setProxyStats] = useState<DimensionStat[]>([]);
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    const [modelsResult, proxiesResult] = await Promise.allSettled([
+      api(`/api/stats/models?window=${windowName}`),
+      api(`/api/stats/proxies?window=${windowName}`),
+    ]);
+    const modelsOK = modelsResult.status === "fulfilled" && Array.isArray(modelsResult.value);
+    const proxiesOK = proxiesResult.status === "fulfilled" && Array.isArray(proxiesResult.value);
+    if (modelsOK) setModelStats(modelsResult.value as DimensionStat[]);
+    if (proxiesOK) setProxyStats(proxiesResult.value as DimensionStat[]);
+    const failed = [modelsOK, proxiesOK].filter((ok) => !ok);
+    setError(failed.length ? "部分维度统计暂时不可用" : "");
+  }, [windowName]);
+  useEffect(() => {
+    const url = new URL(location.href);
+    url.searchParams.set("stats_window", windowName);
+    history.replaceState(null, "", url);
+    void load();
+  }, [load, windowName]);
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    const timer = window.setInterval(refreshWhenVisible, 10_000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [load]);
+  const dimensionTable = (title: string, stats: DimensionStat[], empty: string) => (
+    <div className="dimension-table-wrap">
+      <h3>{title}</h3>
+      <div className="dimension-table">
+        <div className="dimension-head">
+          <span>对象</span><span>请求 / 成功率</span><span>Token</span><span>总耗时 P50 / P95</span><span>首 Token P50 / P95</span>
+        </div>
+        {stats.slice(0, 8).map((stat) => (
+          <div className="dimension-row" key={stat.name}>
+            <b title={stat.name}>{stat.name}</b>
+            <span>{fmt(stat.requests)} / {(stat.success_rate * 100).toFixed(1)}%</span>
+            <span>{fmt(stat.tokens)}</span>
+            <span>{formatDuration(stat.p50_latency_ms)} / {formatDuration(stat.p95_latency_ms)}</span>
+            <span>{formatDuration(stat.p50_first_token_latency_ms)} / {formatDuration(stat.p95_first_token_latency_ms)}</span>
+          </div>
+        ))}
+        {!stats.length && <Empty text={empty} />}
+      </div>
+    </div>
+  );
+  return (
+    <section className="panel dashboard-stats-panel">
+      <div className="panel-head">
+        <div><span className="eyebrow">SERVICE WINDOWS</span><h3>路径与模型表现</h3><p className="muted">用户错误与外部异常分开计入成功率。</p></div>
+        <div className="time-segments stats-window" role="group" aria-label="仪表盘时间窗口">
+          {statsWindows.map((option) => <button key={option.value} type="button" className={windowName === option.value ? "active" : ""} onClick={() => setWindowName(option.value)}>{option.label}</button>)}
+        </div>
+      </div>
+      {error && <p className="stats-warning">{error}</p>}
+      <div className="dimension-scroll">{dimensionTable("按模型", modelStats, "所选时间窗口内没有模型请求")}</div>
+      <div className="dimension-scroll">{dimensionTable("按代理", proxyStats, "所选时间窗口内没有代理请求")}</div>
+    </section>
+  );
+}
+
 function Proxies({
   upstream,
   reload,
@@ -593,8 +771,8 @@ function Proxies({
   refreshToken,
 }: {
   upstream: any;
-  reload: () => Promise<void>;
-  notify: (v: string) => void;
+  reload: () => Promise<unknown>;
+  notify: (v: string, type?: ToastType) => void;
   refreshToken: number;
 }) {
   const [text, setText] = useState("");
@@ -626,6 +804,8 @@ function Proxies({
   const [resinToken, setResinToken] = useState("");
   const [resinTokenDirty, setResinTokenDirty] = useState(false);
   const [resinResult, setResinResult] = useState<any>(null);
+  const [importResults, setImportResults] = useState<ImportResult[]>([]);
+  const [probeJob, setProbeJob] = useState<ProbeJob | null>(null);
   const loadProxies = useCallback(
     async (requestedPage: number, requestedPageSize: number) => {
       setLoading(true);
@@ -647,7 +827,7 @@ function Proxies({
           current.filter((id) => data.items.some((proxy) => proxy.id === id)),
         );
       } catch (e) {
-        notify((e as Error).message);
+        notify((e as Error).message, "error");
       } finally {
         setLoading(false);
       }
@@ -663,7 +843,7 @@ function Proxies({
       setResinToken("");
       setResinTokenDirty(false);
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     }
   }, [notify]);
   useEffect(() => {
@@ -674,6 +854,19 @@ function Proxies({
     () => setSessionLimit(String(upstream.session_proxy_request_limit ?? 50)),
     [upstream.session_proxy_request_limit],
   );
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      void loadProxies(proxyPage, pageSize);
+      void loadEngine();
+    };
+    const timer = window.setInterval(refreshWhenVisible, 30_000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [loadEngine, loadProxies, pageSize, proxyPage]);
   const refreshAfterMutation = async (requestedPage = proxyPage) => {
     await reload();
     if (requestedPage !== proxyPage) {
@@ -701,11 +894,16 @@ function Proxies({
         body: JSON.stringify(payload),
       });
       const ok = d.results.filter((x: any) => x.status === "imported").length;
-      notify(`已导入 ${ok} 个代理${expiry === "0" ? "" : "，已设置有效期"}`);
+      setImportResults(d.results as ImportResult[]);
+      const failed = d.results.length - ok;
+      notify(
+        `已导入 ${ok} 个代理${failed ? `，${failed} 行需处理` : ""}${expiry === "0" ? "" : "，已设置有效期"}`,
+        failed ? "warning" : "success",
+      );
       setText("");
       await refreshAfterMutation(1);
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -719,7 +917,7 @@ function Proxies({
       });
       await refreshAfterMutation();
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -732,7 +930,7 @@ function Proxies({
       notify("代理已删除");
       await refreshAfterMutation();
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -756,11 +954,48 @@ function Proxies({
       setSelected([]);
       await refreshAfterMutation();
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
   };
+  const probeCurrentPage = async () => {
+    setBusy(true);
+    try {
+      const job = (await api("/api/proxy-probes", {
+        method: "POST",
+        body: JSON.stringify({ ids: proxies.map((proxy) => proxy.id), mode: "both" }),
+      })) as ProbeJob;
+      setProbeJob(job);
+      notify("代理探测已开始");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    if (!probeJob || probeJob.status !== "running") return;
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const next = (await api(`/api/proxy-probes/${probeJob.id}`)) as ProbeJob;
+        setProbeJob(next);
+        if (next.status === "completed") {
+          notify("代理探测已完成", next.results.some((result) => !result.exit_ok) ? "warning" : "success");
+          void loadProxies(proxyPage, pageSize);
+        }
+      } catch (error) {
+        notify((error as Error).message, "error");
+      }
+    };
+    const timer = window.setInterval(poll, 1200);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [loadProxies, notify, pageSize, probeJob, proxyPage]);
   const saveEngine = async (nextEngine = engineConfig.engine) => {
     setBusy(true);
     try {
@@ -781,29 +1016,22 @@ function Proxies({
       await reload();
       notify(nextEngine === "resin" ? "Resin gateway enabled" : "Built-in pool enabled");
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
   };
-  const testResin = async (recover = false) => {
+  const testResin = async () => {
     setBusy(true);
     try {
-      const path = recover
-        ? "/api/settings/proxy-engine/resin/recover"
-        : "/api/settings/proxy-engine/resin/test";
-      const result = await api(path, { method: "POST", body: "{}" });
+      const result = await api("/api/settings/proxy-engine/resin/test", { method: "POST", body: "{}" });
       setResinResult(result);
-      if (recover) {
-        await loadEngine();
-        await reload();
-        notify("Resin gateway recovered");
-      } else {
-        notify("Resin gateway test passed");
-      }
+      await loadEngine();
+      await reload();
+      notify("Resin gateway test passed");
     } catch (e) {
       setResinResult({ ok: false, error: (e as Error).message });
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -901,17 +1129,12 @@ function Proxies({
               <button className="secondary" type="button" disabled={busy || !engineConfig.resin_configured} onClick={() => void testResin()}>
                 Test gateway
               </button>
-              {engineConfig.resin_fallback_active && (
-                <button className="secondary" type="button" disabled={busy} onClick={() => void testResin(true)}>
-                  Recover Resin
-                </button>
-              )}
             </div>
-            {engineConfig.resin_fallback_active && (
-              <div className="resin-state error-line">
-                Resin fallback active: {engineConfig.resin_fallback_reason || "gateway unavailable"}
-              </div>
-            )}
+            <div className={`resin-state ${engineConfig.resin_health === "degraded" ? "error-line" : "muted"}`}>
+              Resin 状态：{engineConfig.resin_health === "healthy" ? "健康" : engineConfig.resin_health === "degraded" ? "不可达或异常" : "尚未检测"}
+              {engineConfig.resin_last_checked_at ? ` · ${new Date(engineConfig.resin_last_checked_at).toLocaleString()}` : ""}
+              {engineConfig.resin_last_check_error ? ` · ${engineConfig.resin_last_check_error}` : ""}
+            </div>
             {resinResult && (
               <div className={`test-result ${resinResult.ok ? "ok" : "bad"}`}>
                 {resinResult.ok ? "Gateway ready" : resinResult.error || "Gateway test failed"}
@@ -964,7 +1187,7 @@ function Proxies({
                 notify("会话路由额度已保存");
                 reload();
               } catch (e) {
-                notify((e as Error).message);
+                notify((e as Error).message, "error");
               } finally {
                 setBusy(false);
               }
@@ -1017,6 +1240,18 @@ function Proxies({
           <Upload size={16} />
           {busy ? "导入中…" : "导入代理"}
         </button>
+        {importResults.length > 0 && (
+          <div className="import-report" aria-live="polite">
+            {importResults.map((result) => (
+              <div key={`${result.line}-${result.uri}`} className={result.status === "imported" ? "ok" : "bad"}>
+                <b>第 {result.line} 行</b>
+                <code>{result.uri}</code>
+                <span>{result.status === "imported" ? "已导入" : result.status === "duplicate" ? "重复" : result.error || "导入失败"}</span>
+                {result.status !== "imported" && <button className="icon-btn" title="复制失败行" onClick={async () => { try { await navigator.clipboard.writeText(result.uri); notify("失败行已复制"); } catch { notify("复制失败", "error"); } }}><Copy size={14} /></button>}
+              </div>
+            ))}
+          </div>
+        )}
       </section>
       <section className="panel">
         <div className="panel-head">
@@ -1054,6 +1289,14 @@ function Proxies({
               <span>全选本页</span>
             </label>
             <button
+              className="secondary"
+              onClick={probeCurrentPage}
+              disabled={!proxies.length || busy || loading}
+            >
+              <Radio size={14} />
+              {probeJob?.status === "running" ? `${probeJob.completed}/${probeJob.total}` : "检测本页"}
+            </button>
+            <button
               className="danger-button"
               onClick={bulkDelete}
               disabled={!selected.length || busy || loading}
@@ -1087,9 +1330,13 @@ function Proxies({
                   <b className="mono">{p.uri}</b>
                   <small>
                     {p.scheme.toUpperCase()} · {p.host}:{p.port}
-                    {p.expires_at
-                      ? ` · 到期 ${new Date(p.expires_at).toLocaleString()}`
-                      : ""}
+                     {p.expires_at
+                        ? ` · 到期 ${new Date(p.expires_at).toLocaleString()}`
+                        : ""}
+                    {p.last_probe_at
+                      ? ` · 检测 ${new Date(p.last_probe_at).toLocaleString()}${p.last_exit_ip ? ` · ${p.last_exit_ip}` : ""}`
+                      : " · 未检测"}
+                    {p.last_probe_error ? ` · ${p.last_probe_error}` : ""}
                   </small>
                 </div>
               </div>
@@ -1179,6 +1426,110 @@ function Proxies({
   );
 }
 
+function ClientKeysPanel({ notify }: { notify: (value: string, type?: ToastType) => void }) {
+  const [keys, setKeys] = useState<ClientKey[]>([]);
+  const [name, setName] = useState("");
+  const [rpm, setRPM] = useState("0");
+  const [tpm, setTPM] = useState("0");
+  const [expiresAt, setExpiresAt] = useState("");
+  const [created, setCreated] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try {
+      setKeys((await api("/api/client-keys")) as ClientKey[]);
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
+  }, [notify]);
+  useEffect(() => void load(), [load]);
+  const create = async () => {
+    const rpmLimit = Number(rpm);
+    const tpmLimit = Number(tpm);
+    if (!name.trim() || !Number.isInteger(rpmLimit) || !Number.isInteger(tpmLimit)) {
+      notify("请填写 Key 名称和整数限额", "warning");
+      return;
+    }
+    setBusy(true);
+    try {
+      const data = await api("/api/client-keys", { method: "POST", body: JSON.stringify({ name, expires_at: expiresAt ? new Date(expiresAt).toISOString() : "", rpm_limit: rpmLimit, tpm_limit: tpmLimit }) });
+      setCreated(data.client_key);
+      setName("");
+		setExpiresAt("");
+      await load();
+      notify("客户端 Key 已创建");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  const update = async (key: ClientKey, patch: Partial<ClientKey>) => {
+    setBusy(true);
+    try {
+      await api(`/api/client-keys/${key.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await load();
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally { setBusy(false); }
+  };
+  const rotate = async (key: ClientKey) => {
+    if (!confirm(`轮换 ${key.name} 后旧 Key 会失效，继续？`)) return;
+    try {
+      const data = await api(`/api/client-keys/${key.id}/rotate`, { method: "POST" });
+      setCreated(data.client_key);
+      notify("新 Key 已生成，请立即复制");
+      await load();
+    } catch (error) { notify((error as Error).message, "error"); }
+  };
+  const remove = async (key: ClientKey) => {
+    if (!confirm(`删除 ${key.name} 后无法再使用该 Key，继续？`)) return;
+    setBusy(true);
+    try {
+      await api(`/api/client-keys/${key.id}`, { method: "DELETE" });
+      await load();
+      notify("客户端 Key 已删除");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <section className="panel client-keys-panel">
+    <div className="panel-head"><div><span className="eyebrow">CLIENT ACCESS</span><h3>客户端 Key</h3><p className="muted">每个客户端可独立撤销、限流和审计。</p></div><UsersRound size={20} /></div>
+    <div className="key-create-grid">
+      <label>名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 CI" /></label>
+      <label>RPM<input type="number" min="0" value={rpm} onChange={(event) => setRPM(event.target.value)} /></label>
+      <label>TPM<input type="number" min="0" value={tpm} onChange={(event) => setTPM(event.target.value)} /></label>
+		<label>到期时间<input type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} /></label>
+      <button className="secondary" onClick={create} disabled={busy}>创建 Key</button>
+    </div>
+    {created && <div className="copy-field"><code>{created}</code><button className="icon-btn" title="复制 Key" onClick={async () => { try { await navigator.clipboard.writeText(created); notify("客户端 Key 已复制"); } catch { notify("复制失败", "error"); } }}><Copy size={15} /></button></div>}
+    <div className="key-list">
+      {keys.map((key) => <div className="key-row" key={key.id}>
+        <div><b>{key.name}</b><small>{key.hint} · {key.rpm_limit || "∞"} RPM · {key.tpm_limit || "∞"} TPM{key.expires_at ? ` · 到期 ${new Date(key.expires_at).toLocaleString()}` : ""}{key.last_used_at ? ` · 最近使用 ${new Date(key.last_used_at).toLocaleString()}` : ""}</small></div>
+        <span className={`health ${key.enabled ? "healthy" : "disabled"}`}><i />{key.enabled ? "启用" : "已停用"}</span>
+        <div className="row-actions"><button className="icon-btn" title={key.enabled ? "停用 Key" : "启用 Key"} onClick={() => void update(key, { enabled: !key.enabled })} disabled={busy}><KeyRound size={15} /></button><button className="icon-btn" title="轮换 Key" onClick={() => void rotate(key)} disabled={busy}><RefreshCw size={15} /></button>{keys.length > 1 && <button className="icon-btn" title="删除 Key" onClick={() => void remove(key)} disabled={busy}><Trash2 size={15} /></button>}</div>
+      </div>)}
+    </div>
+  </section>;
+}
+
+function ModelAliasesPanel({ models, notify }: { models: Model[]; notify: (value: string, type?: ToastType) => void }) {
+  const [aliases, setAliases] = useState<ModelAlias[]>([]);
+  const [alias, setAlias] = useState("");
+  const [target, setTarget] = useState("");
+  const load = useCallback(async () => { try { setAliases((await api("/api/model-aliases")) as ModelAlias[]); } catch (error) { notify((error as Error).message, "error"); } }, [notify]);
+  useEffect(() => void load(), [load]);
+  const create = async () => {
+    try { await api("/api/model-aliases", { method: "POST", body: JSON.stringify({ alias, target_model_id: target }) }); setAlias(""); await load(); notify("模型别名已保存"); } catch (error) { notify((error as Error).message, "error"); }
+  };
+  return <section className="panel alias-panel">
+    <div className="panel-head"><div><span className="eyebrow">STABLE ROUTES</span><h3>模型别名</h3><p className="muted">别名始终映射到一个已启用的 Free 模型。</p></div><Database size={20} /></div>
+    <div className="alias-create-grid"><label>别名<input value={alias} onChange={(event) => setAlias(event.target.value)} placeholder="free-fast" /></label><label>目标模型<select value={target} onChange={(event) => setTarget(event.target.value)}><option value="">选择模型</option>{models.filter((model) => model.admin_enabled !== false).map((model) => <option key={model.model_id} value={model.model_id}>{model.model_id}</option>)}</select></label><button className="secondary" onClick={create} disabled={!alias || !target}>添加别名</button></div>
+    <div className="key-list">{aliases.map((item) => <div className="key-row" key={item.id}><div><b>{item.alias}</b><small>→ {item.target_model_id}</small></div><span className={`health ${item.enabled ? "healthy" : "disabled"}`}><i />{item.enabled ? "启用" : "已停用"}</span><div className="row-actions"><button className="icon-btn" title={item.enabled ? "停用别名" : "启用别名"} onClick={async () => { try { await api(`/api/model-aliases/${item.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !item.enabled }) }); await load(); } catch (error) { notify((error as Error).message, "error"); } }}><KeyRound size={15} /></button><button className="icon-btn" title="删除别名" onClick={async () => { try { await api(`/api/model-aliases/${item.id}`, { method: "DELETE" }); await load(); } catch (error) { notify((error as Error).message, "error"); } }}><Trash2 size={15} /></button></div></div>)}</div>
+  </section>;
+}
+
 function Models({
   models,
   upstream,
@@ -1188,7 +1539,7 @@ function Models({
   models: Model[];
   upstream: any;
   reload: () => void;
-  notify: (v: string) => void;
+  notify: (v: string, type?: ToastType) => void;
 }) {
   const [base, setBase] = useState(upstream.base_url || "");
   const [key, setKey] = useState("");
@@ -1222,7 +1573,7 @@ function Models({
     try {
       customHeaders = parseHeaderText(headers);
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
       return;
     }
     setBusy(true);
@@ -1244,7 +1595,7 @@ function Models({
       setVisionKey("");
       reload();
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -1256,7 +1607,7 @@ function Models({
       notify(d.warning || `已刷新 ${d.free_model_count} 个 Free 模型`);
       reload();
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -1270,7 +1621,7 @@ function Models({
       setClientKey(d.client_key);
       notify("新 Key 已生成，请立即复制");
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     }
   };
   const testKey = async () => {
@@ -1281,18 +1632,37 @@ function Models({
       setTestResult(d);
       notify("上游 Key 测试完成");
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
   };
-  const copy = () => {
-    navigator.clipboard?.writeText(`${location.origin}/v1`);
-    notify("网关地址已复制");
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(`${location.origin}/v1`);
+      notify("网关地址已复制");
+    } catch {
+      notify("复制失败", "error");
+    }
   };
-  const copyKey = () => {
-    navigator.clipboard?.writeText(clientKey);
-    notify("客户端 Key 已复制");
+  const copyKey = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(clientKey);
+      notify("客户端 Key 已复制");
+    } catch {
+      notify("复制失败", "error");
+    }
+  };
+  const setModelEnabled = async (model: Model) => {
+    try {
+      await api(`/api/models/${model.id}/policy`, { method: "PATCH", body: JSON.stringify({ enabled: model.admin_enabled === false }) });
+      await reload();
+      notify(model.admin_enabled === false ? "模型已启用" : "模型已停用");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
   };
   return (
     <div className="page">
@@ -1498,7 +1868,7 @@ function Models({
             <div className="model-card" key={m.model_id}>
               <div className="model-card-top">
                 <span className="model-swatch">✦</span>
-                <span className="status-tag">FREE</span>
+                <button className={m.admin_enabled === false ? "status-tag muted-tag" : "status-tag"} onClick={() => void setModelEnabled(m)} title={m.admin_enabled === false ? "启用模型" : "停用模型"}>{m.admin_enabled === false ? "OFF" : "FREE"}</button>
               </div>
               <b>{m.model_id}</b>
               <small>{m.display_name}</small>
@@ -1510,11 +1880,13 @@ function Models({
           {models.length === 0 && <Empty text="刷新上游以发现 Free 模型" />}
         </div>
       </section>
+      <ModelAliasesPanel models={models} notify={notify} />
+      <ClientKeysPanel notify={notify} />
     </div>
   );
 }
 
-function PasswordCard({ notify }: { notify: (v: string) => void }) {
+function PasswordCard({ notify }: { notify: (v: string, type?: ToastType) => void }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1534,7 +1906,7 @@ function PasswordCard({ notify }: { notify: (v: string) => void }) {
       notify("管理员密码已更新，请重新登录");
       window.setTimeout(() => window.location.reload(), 500);
     } catch (e) {
-      notify((e as Error).message);
+      notify((e as Error).message, "error");
     } finally {
       setBusy(false);
     }
@@ -1576,11 +1948,61 @@ function PasswordCard({ notify }: { notify: (v: string) => void }) {
   );
 }
 
+function OperationsSettings({ notify }: { notify: (value: string, type?: ToastType) => void }) {
+  const [probes, setProbes] = useState<ProbeSettings>({ enabled: true, exit_minutes: 15, upstream_minutes: 60 });
+  const [alerts, setAlerts] = useState<AlertSettings>({ enabled: false, webhook_url: "", has_webhook_secret: false, events: alertEventOptions.map((event) => event.value), low_proxy_threshold: 3, success_rate_percent: 80 });
+  const [refreshMinutes, setRefreshMinutes] = useState(360);
+  const [secret, setSecret] = useState("");
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    Promise.allSettled([api("/api/settings/probes"), api("/api/settings/alerts"), api("/api/settings/model-refresh")]).then(([probeResult, alertResult, refreshResult]) => {
+      if (probeResult.status === "fulfilled") setProbes(probeResult.value as ProbeSettings);
+      if (alertResult.status === "fulfilled") setAlerts(alertResult.value as AlertSettings);
+      if (refreshResult.status === "fulfilled") setRefreshMinutes(refreshResult.value.refresh_minutes);
+    });
+  }, []);
+  const save = async () => {
+    setBusy(true);
+    try {
+      await Promise.all([
+        api("/api/settings/probes", { method: "PUT", body: JSON.stringify(probes) }),
+        api("/api/settings/model-refresh", { method: "PUT", body: JSON.stringify({ refresh_minutes: refreshMinutes }) }),
+        api("/api/settings/alerts", { method: "PUT", body: JSON.stringify({ ...alerts, webhook_secret: secret || undefined }) }),
+      ]);
+      setSecret("");
+      notify("运行与告警设置已保存");
+    } catch (error) {
+      notify((error as Error).message, "error");
+    } finally { setBusy(false); }
+  };
+  return <section className="panel operations-panel">
+    <div className="panel-head"><div><span className="eyebrow">OPERATIONS</span><h3>探测、刷新与告警</h3><p className="muted">探测默认开启，告警仅在配置 Webhook 后启用。</p></div><Radio size={20} /></div>
+    <div className="operations-grid">
+      <label className="vision-proxy-toggle"><input type="checkbox" checked={probes.enabled} onChange={(event) => setProbes((current) => ({ ...current, enabled: event.target.checked }))} /><span><b>后台代理探测</b><small>出口与上游路径定时复测</small></span></label>
+      <label>出口探测（分钟）<input type="number" min="5" value={probes.exit_minutes} onChange={(event) => setProbes((current) => ({ ...current, exit_minutes: Number(event.target.value) }))} /></label>
+      <label>上游探测（分钟）<input type="number" min="15" value={probes.upstream_minutes} onChange={(event) => setProbes((current) => ({ ...current, upstream_minutes: Number(event.target.value) }))} /></label>
+      <label>模型刷新（分钟，0 关闭）<input type="number" min="0" value={refreshMinutes} onChange={(event) => setRefreshMinutes(Number(event.target.value))} /></label>
+    </div>
+    <div className="operations-grid alert-grid">
+      <label className="vision-proxy-toggle"><input type="checkbox" checked={alerts.enabled} onChange={(event) => setAlerts((current) => ({ ...current, enabled: event.target.checked }))} /><span><b>Webhook 告警</b><small>低可用、Resin、刷新和限流异常</small></span></label>
+      <label>Webhook URL<input value={alerts.webhook_url} onChange={(event) => setAlerts((current) => ({ ...current, webhook_url: event.target.value }))} placeholder="https://hooks.example.com/relaydesk" /></label>
+      <label>签名密钥<input type="password" value={secret} onChange={(event) => setSecret(event.target.value)} placeholder={alerts.has_webhook_secret ? "已保存 · 留空保持不变" : "可选 HMAC 密钥"} /></label>
+      <label>低可用阈值<input type="number" min="1" value={alerts.low_proxy_threshold} onChange={(event) => setAlerts((current) => ({ ...current, low_proxy_threshold: Number(event.target.value) }))} /></label>
+      <label>成功率阈值（%）<input type="number" min="1" max="100" value={alerts.success_rate_percent} onChange={(event) => setAlerts((current) => ({ ...current, success_rate_percent: Number(event.target.value) }))} /></label>
+    </div>
+    <fieldset className="alert-event-options">
+      <legend>告警事件</legend>
+      {alertEventOptions.map((event) => <label key={event.value}><input type="checkbox" checked={alerts.events.includes(event.value)} onChange={(input) => setAlerts((current) => ({ ...current, events: input.target.checked ? [...current.events, event.value] : current.events.filter((value) => value !== event.value) }))} />{event.label}</label>)}
+    </fieldset>
+    <button className="secondary" onClick={save} disabled={busy}>{busy ? "保存中…" : "保存运行设置"}</button>
+  </section>;
+}
+
 function SettingsPage({
   notify,
   onLogout,
 }: {
-  notify: (value: string) => void;
+  notify: (value: string, type?: ToastType) => void;
   onLogout: () => void;
 }) {
   const [retentionDays, setRetentionDays] = useState(90);
@@ -1595,7 +2017,7 @@ function SettingsPage({
       })
       .catch((error) => {
         if ((error as Error).message === "AUTH") onLogout();
-        else notify((error as Error).message);
+        else notify((error as Error).message, "error");
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -1616,7 +2038,7 @@ function SettingsPage({
       notify("使用记录保留时间已保存");
     } catch (error) {
       if ((error as Error).message === "AUTH") onLogout();
-      else notify((error as Error).message);
+      else notify((error as Error).message, "error");
     } finally {
       setSaving(false);
     }
@@ -1632,6 +2054,7 @@ function SettingsPage({
         </div>
       </div>
       <PasswordCard notify={notify} />
+      <OperationsSettings notify={notify} />
       <section className="panel retention-panel">
         <div className="panel-head">
           <div>
@@ -1685,6 +2108,23 @@ const emptyUsageFilters = (): UsageFilters => ({
   customTo: "",
 });
 
+const usageFiltersFromURL = (): UsageFilters => {
+  const params = new URLSearchParams(location.search);
+  const time = params.get("usage_time") as UsageTimePreset | null;
+  return {
+    time: usageTimeOptions.some((option) => option.value === time) ? time! : "all",
+    model: params.get("usage_model") || "",
+    status: ["success", "error", "external"].includes(params.get("usage_status") || "") ? params.get("usage_status") as UsageFilters["status"] : "",
+    customFrom: params.get("usage_from") || "",
+    customTo: params.get("usage_to") || "",
+  };
+};
+
+const positiveURLNumber = (name: string, fallback: number) => {
+  const value = Number(new URLSearchParams(location.search).get(name));
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+};
+
 const formatDuration = (milliseconds?: number) => {
   if (milliseconds === undefined || milliseconds === null) return "—";
   if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
@@ -1699,23 +2139,19 @@ function Usage({
   onLogout,
   refreshToken,
 }: {
-  notify: (value: string) => void;
+  notify: (value: string, type?: ToastType) => void;
   onLogout: () => void;
   refreshToken: number;
 }) {
   const [rows, setRows] = useState<RequestRow[]>([]);
   const [models, setModels] = useState<string[]>([]);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(25);
+  const [page, setPage] = useState(() => positiveURLNumber("usage_page", 1));
+  const [pageSize, setPageSize] = useState(() => positiveURLNumber("usage_size", 25));
   const [total, setTotal] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [loading, setLoading] = useState(true);
-  const [draftFilters, setDraftFilters] = useState<UsageFilters>(
-    emptyUsageFilters,
-  );
-  const [appliedFilters, setAppliedFilters] = useState<UsageFilters>(
-    emptyUsageFilters,
-  );
+  const [draftFilters, setDraftFilters] = useState<UsageFilters>(usageFiltersFromURL);
+  const [appliedFilters, setAppliedFilters] = useState<UsageFilters>(usageFiltersFromURL);
   const [rates, setRates] = useState<UsageRates>({
     window_seconds: 60,
     rpm: 0,
@@ -1766,7 +2202,7 @@ function Usage({
           onLogout();
           return;
         }
-        notify((error as Error).message);
+        notify((error as Error).message, "error");
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -1778,8 +2214,25 @@ function Usage({
   }, [requestPath]);
 
   useEffect(() => {
+    const url = new URL(location.href);
+    const setOrClear = (name: string, value: string, defaultValue = "") => {
+      if (value && value !== defaultValue) url.searchParams.set(name, value);
+      else url.searchParams.delete(name);
+    };
+    setOrClear("usage_time", appliedFilters.time, "all");
+    setOrClear("usage_model", appliedFilters.model);
+    setOrClear("usage_status", appliedFilters.status);
+    setOrClear("usage_from", appliedFilters.time === "custom" ? appliedFilters.customFrom : "");
+    setOrClear("usage_to", appliedFilters.time === "custom" ? appliedFilters.customTo : "");
+    setOrClear("usage_page", String(page), "1");
+    setOrClear("usage_size", String(pageSize), "25");
+    history.replaceState(null, "", url);
+  }, [appliedFilters, page, pageSize]);
+
+  useEffect(() => {
     let active = true;
     const loadRates = async () => {
+		if (document.visibilityState !== "visible") return;
       try {
         const data = (await api("/api/usage/rates")) as UsageRates;
         if (active) setRates(data);
@@ -1789,9 +2242,11 @@ function Usage({
     };
     void loadRates();
     const timer = window.setInterval(loadRates, 10_000);
+    document.addEventListener("visibilitychange", loadRates);
     return () => {
       active = false;
       window.clearInterval(timer);
+		document.removeEventListener("visibilitychange", loadRates);
     };
   }, [refreshToken]);
 
@@ -1803,7 +2258,7 @@ function Usage({
       })
       .catch((error) => {
         if ((error as Error).message === "AUTH") onLogout();
-        else notify((error as Error).message);
+        else notify((error as Error).message, "error");
       });
     return () => {
       active = false;
@@ -2139,7 +2594,7 @@ function Empty({ text }: { text: string }) {
   );
 }
 export default App;
+export { ClientKeysPanel, Models, Proxies, Usage };
 
 const root = document.getElementById("root");
-if (!root) throw new Error("Root element not found");
-createRoot(root).render(<App />);
+if (root) createRoot(root).render(<App />);

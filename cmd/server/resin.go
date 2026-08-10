@@ -56,6 +56,7 @@ type proxyEngineStatus struct {
 	ResinFallbackReason string     `json:"resin_fallback_reason,omitempty"`
 	ResinLastCheckedAt  *time.Time `json:"resin_last_checked_at,omitempty"`
 	ResinLastCheckError string     `json:"resin_last_check_error,omitempty"`
+	ResinHealth         string     `json:"resin_health"`
 }
 
 func settingValue(db *sql.DB, key string) (string, error) {
@@ -79,6 +80,29 @@ func parseStoredTime(value string) *time.Time {
 }
 
 func (a *App) loadProxyEngine() (proxyEngineConfig, error) {
+	a.runtimeCaches.engine.mu.RLock()
+	if a.runtimeCaches.engine.loaded {
+		cfg := cloneProxyEngineConfig(a.runtimeCaches.engine.cfg)
+		a.runtimeCaches.engine.mu.RUnlock()
+		return cfg, nil
+	}
+	a.runtimeCaches.engine.mu.RUnlock()
+
+	a.runtimeCaches.engine.mu.Lock()
+	defer a.runtimeCaches.engine.mu.Unlock()
+	if a.runtimeCaches.engine.loaded {
+		return cloneProxyEngineConfig(a.runtimeCaches.engine.cfg), nil
+	}
+	cfg, err := a.loadProxyEngineFromDB()
+	if err != nil {
+		return cfg, err
+	}
+	a.runtimeCaches.engine.cfg = cloneProxyEngineConfig(cfg)
+	a.runtimeCaches.engine.loaded = true
+	return cloneProxyEngineConfig(cfg), nil
+}
+
+func (a *App) loadProxyEngineFromDB() (proxyEngineConfig, error) {
 	cfg := proxyEngineConfig{Engine: proxyEngineBuiltin, ResinPlatform: "Default"}
 	var err error
 	if raw, readErr := settingValue(a.db, proxyEngineSettingKey); readErr != nil {
@@ -169,6 +193,12 @@ func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 		_, platformErr := validateResinPlatform(cfg.ResinPlatform)
 		configured = urlErr == nil && platformErr == nil
 	}
+	health := "unknown"
+	if configured && cfg.LastCheckError == "" && cfg.LastCheckedAt != nil {
+		health = "healthy"
+	} else if cfg.LastCheckError != "" {
+		health = "degraded"
+	}
 	return proxyEngineStatus{
 		Engine:              cfg.Engine,
 		EffectiveEngine:     cfg.Engine,
@@ -181,6 +211,7 @@ func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 		ResinFallbackReason: cfg.FallbackReason,
 		ResinLastCheckedAt:  cfg.LastCheckedAt,
 		ResinLastCheckError: cfg.LastCheckError,
+		ResinHealth:         health,
 	}, nil
 }
 
@@ -273,6 +304,7 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save proxy engine"})
 		return
 	}
+	a.invalidateProxyEngineCache()
 	status, err := a.proxyEngineStatus()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "proxy engine was saved but could not be read"})
@@ -344,8 +376,9 @@ func (a *App) nextResinAccount(sessionKey string) (string, error) {
 	if sessionKey == "" {
 		return "", nil
 	}
-	a.routingMu.Lock()
-	defer a.routingMu.Unlock()
+	lock := &a.routingLocks[sessionRouteLockIndex(sessionKey)]
+	lock.Lock()
+	defer lock.Unlock()
 	now := time.Now().UTC().Format(time.RFC3339)
 	var generation, requestCount int
 	err := a.db.QueryRow("SELECT generation,request_count FROM resin_session_routes WHERE session_key=?", sessionKey).Scan(&generation, &requestCount)
@@ -375,10 +408,20 @@ func (a *App) advanceResinAccount(sessionKey string) error {
 	if sessionKey == "" {
 		return nil
 	}
-	a.routingMu.Lock()
-	defer a.routingMu.Unlock()
+	lock := &a.routingLocks[sessionRouteLockIndex(sessionKey)]
+	lock.Lock()
+	defer lock.Unlock()
 	_, err := a.db.Exec("UPDATE resin_session_routes SET generation=generation+1,request_count=0,updated_at=? WHERE session_key=?", time.Now().UTC().Format(time.RFC3339), sessionKey)
 	return err
+}
+
+func sessionRouteLockIndex(sessionKey string) int {
+	var hash uint64 = 1469598103934665603
+	for i := 0; i < len(sessionKey); i++ {
+		hash ^= uint64(sessionKey[i])
+		hash *= 1099511628211
+	}
+	return int(hash % 64)
 }
 
 func (a *App) clearStaleResinSessionRoutes() {
@@ -400,13 +443,40 @@ func (a *App) resinFailure(err error) {
 	}
 	a.resinFailureCount++
 	a.resinMu.Unlock()
+	a.saveResinProbeResult(err)
+	a.scheduleResinHealthRecheck()
+	a.emitAlert("resin_unavailable", "error", "Resin gateway request failed", map[string]any{"error": truncateError(err.Error())})
+}
+
+func (a *App) scheduleResinHealthRecheck() {
+	a.resinProbeMu.Lock()
+	if time.Since(a.resinLastAutoProbe) < 10*time.Second {
+		a.resinProbeMu.Unlock()
+		return
+	}
+	a.resinLastAutoProbe = time.Now()
+	a.resinProbeMu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		_, err := a.resinProbe(ctx)
+		a.saveResinProbeResult(err)
+	}()
 }
 
 func (a *App) resinSuccess() {
 	a.resinMu.Lock()
+	wasFailing := a.resinFailureCount > 0
 	a.resinFailureCount = 0
 	a.resinFailureStart = time.Time{}
+	shouldPersist := wasFailing || a.resinLastSuccessPersist.IsZero() || time.Since(a.resinLastSuccessPersist) >= time.Minute
+	if shouldPersist {
+		a.resinLastSuccessPersist = time.Now()
+	}
 	a.resinMu.Unlock()
+	if shouldPersist {
+		a.saveResinProbeResult(nil)
+	}
 }
 
 func (a *App) resinProbe(ctx context.Context) (map[string]any, error) {
@@ -477,7 +547,9 @@ func (a *App) saveResinProbeResult(err error) {
 	}
 	if _, saveErr := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?),(?,?)", resinLastCheckedAtSetting, time.Now().UTC().Format(time.RFC3339), resinLastCheckErrorSetting, message); saveErr != nil {
 		log.Printf("save Resin probe result failed: %v", saveErr)
+		return
 	}
+	a.invalidateProxyEngineCache()
 }
 
 func (a *App) testResin(w http.ResponseWriter, r *http.Request) {
@@ -497,14 +569,10 @@ func (a *App) recoverResin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error(), "result": result})
 		return
 	}
-	if _, err = a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?),(?,?),(?,?)", resinFallbackActiveSetting, "false", resinFallbackSinceSetting, "", resinFallbackReasonSetting, ""); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Resin is healthy but fallback could not be cleared"})
-		return
-	}
 	a.resinSuccess()
 	status, err := a.proxyEngineStatus()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Resin was recovered but status could not be read"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Resin was rechecked but status could not be read"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": result, "status": status})
