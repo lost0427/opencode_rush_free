@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1342,5 +1343,144 @@ func TestUsageRetentionSettingsDeleteExpiredRecords(t *testing.T) {
 	a.getUsageRetention(get, httptest.NewRequest(http.MethodGet, "/api/settings/usage-retention", nil))
 	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"usage_retention_days":30`) {
 		t.Fatalf("retention read failed: %d %s", get.Code, get.Body.String())
+	}
+}
+
+func TestResinProxyEngineStoresTokenAndDerivesSessionAccounts(t *testing.T) {
+	a := testApp(t)
+	payload := `{"engine":"resin","resin_gateway_url":"http://resin.example.test:2260","resin_platform":"Default","resin_proxy_token":"proxy-secret"}`
+	recorder := httptest.NewRecorder()
+	a.putProxyEngine(recorder, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(payload)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save Resin engine failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "proxy-secret") {
+		t.Fatalf("Resin proxy token leaked in API response: %s", recorder.Body.String())
+	}
+	cfg, err := a.loadProxyEngine()
+	if err != nil || cfg.Engine != proxyEngineResin || cfg.ResinProxyToken != "proxy-secret" {
+		t.Fatalf("stored Resin configuration is invalid: %#v err=%v", cfg, err)
+	}
+	first, err := a.resinProxyForSession("session-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := a.resinProxyForSession("session-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := a.resinProxyForSession("session-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Username != same.Username || first.Username == other.Username || !strings.HasPrefix(first.Username, "Default.") {
+		t.Fatalf("Resin accounts are not session-stable and isolated: first=%q same=%q other=%q", first.Username, same.Username, other.Username)
+	}
+	if err := a.advanceResinAccount("session-one"); err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := a.resinProxyForSession("session-one")
+	if err != nil || rotated.Username == first.Username {
+		t.Fatalf("Resin account did not rotate: before=%q after=%q err=%v", first.Username, rotated.Username, err)
+	}
+}
+
+func TestResinStaysActiveAfterGatewayFailures(t *testing.T) {
+	a := testApp(t)
+	recorder := httptest.NewRecorder()
+	a.putProxyEngine(recorder, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(`{"engine":"resin","resin_gateway_url":"http://resin.example.test:2260","resin_platform":"Default","resin_proxy_token":"proxy-secret"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save Resin engine failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	for range resinFailureThreshold {
+		a.resinFailure(errors.New("proxyconnect tcp: Resin unavailable"))
+	}
+	status, err := a.proxyEngineStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.ResinFallbackActive || status.EffectiveEngine != proxyEngineResin {
+		t.Fatalf("Resin must remain active after gateway failures: %#v", status)
+	}
+}
+
+func TestUsageRecordsRouteEngine(t *testing.T) {
+	a := testApp(t)
+	a.recordUsageWithEngine("model:free", nil, "http://resin.example.test:2260", proxyEngineResin, "success", http.StatusOK, time.Millisecond, nil, 0, nil, nil)
+	recorder := httptest.NewRecorder()
+	a.usageList(recorder, httptest.NewRequest(http.MethodGet, "/api/usage/requests", nil))
+	var rows []usageRequest
+	if err := json.NewDecoder(recorder.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].RouteEngine != proxyEngineResin || rows[0].ProxyURI != "http://resin.example.test:2260" {
+		t.Fatalf("Resin route usage was not retained: %#v", rows)
+	}
+}
+
+func TestResinHTTPProxyUsesDynamicBasicCredentials(t *testing.T) {
+	a := testApp(t)
+	var authorization string
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization = r.Header.Get("Proxy-Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxyServer.Close()
+	p, err := a.resinProxy(proxyEngineConfig{ResinGatewayURL: proxyServer.URL, ResinPlatform: "Default", ResinProxyToken: "proxy-token"}, "account-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := a.httpClient(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Get("http://target.example.test/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("Default.account-hash:proxy-token"))
+	if authorization != want {
+		t.Fatalf("unexpected Resin proxy authorization: got=%q want=%q", authorization, want)
+	}
+}
+
+func TestRecoverResinClearsPersistedFallback(t *testing.T) {
+	a := testApp(t)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+		if r.URL.Path == "/v1/models" {
+			writeJSON(w, http.StatusOK, map[string]any{"data": []any{}})
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+	}))
+	defer proxyServer.Close()
+	upstreamPayload := `{"base_url":"http://upstream.example.test","api_key":"upstream-token"}`
+	upstreamRecorder := httptest.NewRecorder()
+	a.putUpstream(upstreamRecorder, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(upstreamPayload)))
+	if upstreamRecorder.Code != http.StatusOK {
+		t.Fatalf("save upstream failed: %d %s", upstreamRecorder.Code, upstreamRecorder.Body.String())
+	}
+	enginePayload := `{"engine":"resin","resin_gateway_url":"` + proxyServer.URL + `","resin_platform":"Default","resin_proxy_token":"proxy-token"}`
+	engineRecorder := httptest.NewRecorder()
+	a.putProxyEngine(engineRecorder, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(enginePayload)))
+	if engineRecorder.Code != http.StatusOK {
+		t.Fatalf("save Resin engine failed: %d %s", engineRecorder.Code, engineRecorder.Body.String())
+	}
+	for range resinFailureThreshold {
+		a.resinFailure(errors.New("proxyconnect tcp: unavailable"))
+	}
+	recoverRecorder := httptest.NewRecorder()
+	a.recoverResin(recoverRecorder, httptest.NewRequest(http.MethodPost, "/api/settings/proxy-engine/resin/recover", nil))
+	if recoverRecorder.Code != http.StatusOK {
+		t.Fatalf("recover Resin failed: %d %s", recoverRecorder.Code, recoverRecorder.Body.String())
+	}
+	status, err := a.proxyEngineStatus()
+	if err != nil || status.ResinFallbackActive || status.EffectiveEngine != proxyEngineResin {
+		t.Fatalf("Resin did not recover: %#v err=%v", status, err)
 	}
 }

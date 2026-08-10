@@ -27,6 +27,8 @@ services:
     environment:
       WEB_DIR: /app/web/dist
       DATABASE_PATH: /data/app.db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - opencode_data:/data
     read_only: true

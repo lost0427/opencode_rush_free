@@ -38,6 +38,11 @@ type Summary = {
   total_tokens: number;
   free_models: number;
   active_proxies: number;
+  proxy_engine?: "builtin" | "resin";
+  effective_proxy_engine?: "builtin" | "resin";
+  resin_fallback_active?: boolean;
+  resin_fallback_since?: string;
+  resin_fallback_reason?: string;
 };
 type Proxy = {
   id: number;
@@ -84,6 +89,20 @@ type RequestRow = {
   completion_tokens?: number;
   total_tokens?: number;
   error_message?: string;
+  route_engine?: "builtin" | "resin" | "direct";
+};
+type ProxyEngine = {
+  engine: "builtin" | "resin";
+  effective_engine: "builtin" | "resin";
+  resin_gateway_url: string;
+  resin_platform: string;
+  has_resin_proxy_token: boolean;
+  resin_configured: boolean;
+  resin_fallback_active: boolean;
+  resin_fallback_since?: string;
+  resin_fallback_reason?: string;
+  resin_last_checked_at?: string;
+  resin_last_check_error?: string;
 };
 type UsagePage = {
   items: RequestRow[];
@@ -457,6 +476,20 @@ function Overview({
           </div>
         </div>
       </section>
+      {summary.resin_fallback_active && (
+        <section className="resin-warning" role="alert">
+          <div>
+            <span className="eyebrow">RESIN DEGRADED</span>
+            <strong>Resin is unavailable. New requests use the built-in pool.</strong>
+            {summary.resin_fallback_reason && (
+              <small>{summary.resin_fallback_reason}</small>
+            )}
+          </div>
+          {summary.resin_fallback_since && (
+            <time>{new Date(summary.resin_fallback_since).toLocaleString()}</time>
+          )}
+        </section>
+      )}
       <section className="stat-grid">
         <Stat
           label="总请求数"
@@ -478,7 +511,7 @@ function Overview({
         />
         <Stat
           label="可用代理"
-          value={fmt(summary.active_proxies)}
+          value={summary.effective_proxy_engine === "resin" ? "RESIN" : fmt(summary.active_proxies)}
           detail="参与轮换"
           accent="#5d78a4"
         />
@@ -579,6 +612,20 @@ function Proxies({
   const [sessionLimit, setSessionLimit] = useState(
     String(upstream.session_proxy_request_limit ?? 50),
   );
+  const [engineConfig, setEngineConfig] = useState<ProxyEngine>({
+    engine: "builtin",
+    effective_engine: "builtin",
+    resin_gateway_url: "",
+    resin_platform: "Default",
+    has_resin_proxy_token: false,
+    resin_configured: false,
+    resin_fallback_active: false,
+  });
+  const [resinGatewayURL, setResinGatewayURL] = useState("");
+  const [resinPlatform, setResinPlatform] = useState("Default");
+  const [resinToken, setResinToken] = useState("");
+  const [resinTokenDirty, setResinTokenDirty] = useState(false);
+  const [resinResult, setResinResult] = useState<any>(null);
   const loadProxies = useCallback(
     async (requestedPage: number, requestedPageSize: number) => {
       setLoading(true);
@@ -607,9 +654,22 @@ function Proxies({
     },
     [notify, proxyState],
   );
+  const loadEngine = useCallback(async () => {
+    try {
+      const next = (await api("/api/settings/proxy-engine")) as ProxyEngine;
+      setEngineConfig(next);
+      setResinGatewayURL(next.resin_gateway_url || "");
+      setResinPlatform(next.resin_platform || "Default");
+      setResinToken("");
+      setResinTokenDirty(false);
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }, [notify]);
   useEffect(() => {
     void loadProxies(proxyPage, pageSize);
-  }, [loadProxies, pageSize, proxyPage, refreshToken]);
+    void loadEngine();
+  }, [loadEngine, loadProxies, pageSize, proxyPage, refreshToken]);
   useEffect(
     () => setSessionLimit(String(upstream.session_proxy_request_limit ?? 50)),
     [upstream.session_proxy_request_limit],
@@ -701,6 +761,53 @@ function Proxies({
       setBusy(false);
     }
   };
+  const saveEngine = async (nextEngine = engineConfig.engine) => {
+    setBusy(true);
+    try {
+      const payload: Record<string, unknown> = {
+        engine: nextEngine,
+        resin_gateway_url: resinGatewayURL,
+        resin_platform: resinPlatform,
+      };
+      if (resinTokenDirty) payload.resin_proxy_token = resinToken;
+      const next = (await api("/api/settings/proxy-engine", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      })) as ProxyEngine;
+      setEngineConfig(next);
+      setResinToken("");
+      setResinTokenDirty(false);
+      setResinResult(null);
+      await reload();
+      notify(nextEngine === "resin" ? "Resin gateway enabled" : "Built-in pool enabled");
+    } catch (e) {
+      notify((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const testResin = async (recover = false) => {
+    setBusy(true);
+    try {
+      const path = recover
+        ? "/api/settings/proxy-engine/resin/recover"
+        : "/api/settings/proxy-engine/resin/test";
+      const result = await api(path, { method: "POST", body: "{}" });
+      setResinResult(result);
+      if (recover) {
+        await loadEngine();
+        await reload();
+        notify("Resin gateway recovered");
+      } else {
+        notify("Resin gateway test passed");
+      }
+    } catch (e) {
+      setResinResult({ ok: false, error: (e as Error).message });
+      notify((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const proxyStatus = (proxy: Proxy) => {
     if (proxy.usage_state === "cooldown" || proxy.health_status === "cooldown")
       return { label: "冷却中", className: "cooldown" };
@@ -722,6 +829,97 @@ function Proxies({
           <small>managed paths</small>
         </div>
       </div>
+      <section className="panel engine-panel">
+        <div className="panel-head">
+          <div>
+            <div className="eyebrow">ROUTE ENGINE</div>
+            <h3>Node pool engine</h3>
+          </div>
+          <Network size={20} />
+        </div>
+        <div className="segmented" role="group" aria-label="Node pool engine">
+          <button
+            type="button"
+            className={engineConfig.engine === "builtin" ? "active" : ""}
+            disabled={busy}
+            onClick={() => void saveEngine("builtin")}
+          >
+            Built-in pool
+          </button>
+          <button
+            type="button"
+            className={engineConfig.engine === "resin" ? "active" : ""}
+            disabled={busy}
+            onClick={() => {
+              if (engineConfig.engine === "resin") return;
+              setEngineConfig((current) => ({ ...current, engine: "resin" }));
+            }}
+          >
+            Resin gateway
+          </button>
+        </div>
+        {engineConfig.engine === "resin" && (
+          <div className="resin-config">
+            <div className="config-grid">
+              <label>
+                Resin gateway URL
+                <input
+                  value={resinGatewayURL}
+                  onChange={(event) => setResinGatewayURL(event.target.value)}
+                  placeholder="http://host.docker.internal:2260"
+                  autoComplete="off"
+                />
+              </label>
+              <label>
+                Platform
+                <input
+                  value={resinPlatform}
+                  onChange={(event) => setResinPlatform(event.target.value)}
+                  placeholder="Default"
+                  autoComplete="off"
+                />
+              </label>
+              <label className="resin-token-field">
+                Proxy token
+                <input
+                  type="password"
+                  value={resinToken}
+                  onChange={(event) => {
+                    setResinToken(event.target.value);
+                    setResinTokenDirty(true);
+                  }}
+                  placeholder={engineConfig.has_resin_proxy_token ? "Stored securely" : "Optional when Resin auth is disabled"}
+                  autoComplete="new-password"
+                />
+              </label>
+            </div>
+            <div className="config-actions">
+              <button className="primary" type="button" disabled={busy} onClick={() => void saveEngine("resin")}>
+                <Network size={16} />
+                Save Resin
+              </button>
+              <button className="secondary" type="button" disabled={busy || !engineConfig.resin_configured} onClick={() => void testResin()}>
+                Test gateway
+              </button>
+              {engineConfig.resin_fallback_active && (
+                <button className="secondary" type="button" disabled={busy} onClick={() => void testResin(true)}>
+                  Recover Resin
+                </button>
+              )}
+            </div>
+            {engineConfig.resin_fallback_active && (
+              <div className="resin-state error-line">
+                Resin fallback active: {engineConfig.resin_fallback_reason || "gateway unavailable"}
+              </div>
+            )}
+            {resinResult && (
+              <div className={`test-result ${resinResult.ok ? "ok" : "bad"}`}>
+                {resinResult.ok ? "Gateway ready" : resinResult.error || "Gateway test failed"}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
       <section className="panel routing-panel">
         <div className="panel-head">
           <div>
@@ -1869,7 +2067,7 @@ function Usage({
                   {formatDuration(r.latency_ms)}
                 </span>
                 <span className="mono tiny usage-path" title={r.proxy_uri || "direct"}>
-                  {r.proxy_uri || "direct"}
+                  {(r.route_engine || (r.proxy_uri ? "builtin" : "direct")) + " · " + (r.proxy_uri || "direct")}
                 </span>
               </div>
             ))}
