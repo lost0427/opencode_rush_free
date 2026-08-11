@@ -348,6 +348,54 @@ func (a *App) resinProxyForSession(sessionKey string) (ProxyRecord, error) {
 	return a.resinProxy(cfg, account)
 }
 
+// resinRequestRoute keeps account rotation local to a request when the client
+// does not provide a session ID. Persisted session routes retain their existing
+// sticky behavior, while anonymous requests avoid creating unbounded DB rows.
+type resinRequestRoute struct {
+	sessionKey          string
+	ephemeralSeed       string
+	ephemeralGeneration uint64
+}
+
+func newResinRequestRoute(sessionKey string) (*resinRequestRoute, error) {
+	route := &resinRequestRoute{sessionKey: sessionKey}
+	if sessionKey != "" {
+		return route, nil
+	}
+	seed, err := randomKey()
+	if err != nil {
+		return nil, err
+	}
+	route.ephemeralSeed = seed
+	return route, nil
+}
+
+func (route *resinRequestRoute) proxy(a *App, cfg proxyEngineConfig) (ProxyRecord, error) {
+	if route == nil {
+		return ProxyRecord{}, errors.New("Resin request route is not initialized")
+	}
+	if route.sessionKey != "" {
+		account, err := a.nextResinAccount(route.sessionKey)
+		if err != nil {
+			return ProxyRecord{}, err
+		}
+		return a.resinProxy(cfg, account)
+	}
+	account := hashToken(route.ephemeralSeed + "\x00" + strconv.FormatUint(route.ephemeralGeneration, 10))
+	return a.resinProxy(cfg, account)
+}
+
+func (route *resinRequestRoute) advance(a *App) error {
+	if route == nil {
+		return errors.New("Resin request route is not initialized")
+	}
+	if route.sessionKey != "" {
+		return a.advanceResinAccount(route.sessionKey)
+	}
+	route.ephemeralGeneration++
+	return nil
+}
+
 func (a *App) resinControlPlaneProxy() (ProxyRecord, error) {
 	cfg, err := a.loadProxyEngine()
 	if err != nil {

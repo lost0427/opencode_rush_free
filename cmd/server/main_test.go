@@ -1385,6 +1385,81 @@ func TestResinProxyEngineStoresTokenAndDerivesSessionAccounts(t *testing.T) {
 	}
 }
 
+func TestEphemeralResinRequestRouteRotatesWithoutPersistingSession(t *testing.T) {
+	a := testApp(t)
+	cfg := proxyEngineConfig{
+		Engine:          proxyEngineResin,
+		ResinGatewayURL: "http://resin.example.test:2260",
+		ResinPlatform:   "Default",
+		ResinProxyToken: "proxy-secret",
+	}
+	route, err := newResinRequestRoute("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]struct{}, resinMaxAttempts)
+	for attempt := 0; attempt < resinMaxAttempts; attempt++ {
+		proxy, err := route.proxy(a, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(proxy.Username, "Default.") {
+			t.Fatalf("ephemeral Resin account is malformed: %q", proxy.Username)
+		}
+		if _, exists := seen[proxy.Username]; exists {
+			t.Fatalf("ephemeral Resin account was reused on attempt %d: %q", attempt, proxy.Username)
+		}
+		seen[proxy.Username] = struct{}{}
+		if attempt+1 < resinMaxAttempts {
+			if err := route.advance(a); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var persisted int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM resin_session_routes").Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted != 0 {
+		t.Fatalf("ephemeral Resin routing persisted %d session rows", persisted)
+	}
+}
+
+func TestStickyResinRequestRouteStillPersistsAndRotates(t *testing.T) {
+	a := testApp(t)
+	cfg := proxyEngineConfig{
+		Engine:          proxyEngineResin,
+		ResinGatewayURL: "http://resin.example.test:2260",
+		ResinPlatform:   "Default",
+		ResinProxyToken: "proxy-secret",
+	}
+	route, err := newResinRequestRoute("sticky-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := route.proxy(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := route.advance(a); err != nil {
+		t.Fatal(err)
+	}
+	second, err := route.proxy(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Username == second.Username {
+		t.Fatalf("sticky Resin route did not rotate after 429: %q", first.Username)
+	}
+	var persisted, generation int
+	if err := a.db.QueryRow("SELECT COUNT(*),MAX(generation) FROM resin_session_routes").Scan(&persisted, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if persisted != 1 || generation != 1 {
+		t.Fatalf("sticky Resin route persistence changed: rows=%d generation=%d", persisted, generation)
+	}
+}
+
 func TestResinStaysActiveAfterGatewayFailures(t *testing.T) {
 	a := testApp(t)
 	recorder := httptest.NewRecorder()

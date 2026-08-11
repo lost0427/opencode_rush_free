@@ -1774,6 +1774,14 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	requestSessionKey := sessionKey(r, parsed.User)
+	var resinRoute *resinRequestRoute
+	if resinMode {
+		resinRoute, err = newResinRequestRoute(requestSessionKey)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize Resin account routing"})
+			return
+		}
+	}
 	attempts := 3
 	if resinMode {
 		attempts = resinMaxAttempts
@@ -1787,7 +1795,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	for i := 0; i < attempts; i++ {
 		var p ProxyRecord
 		if resinMode {
-			p, err = a.resinProxyForSession(requestSessionKey)
+			p, err = resinRoute.proxy(a, engineConfig)
 			if err != nil {
 				lastErr = err
 				break
@@ -1882,7 +1890,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "error", helpStatus, time.Since(helperStarted), nil, i, helpTokens, lastErr)
 				if cfg.VisionUseProxy && helpStatus == http.StatusTooManyRequests && i+1 < attempts {
 					if resinMode {
-						_ = a.advanceResinAccount(requestSessionKey)
+						_ = resinRoute.advance(a)
 					} else {
 						a.clearSessionProxy(requestSessionKey, p.ID)
 					}
@@ -1939,7 +1947,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && resinMode {
-			if advanceErr := a.advanceResinAccount(requestSessionKey); advanceErr != nil {
+			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}
 			if i+1 < attempts {
