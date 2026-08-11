@@ -88,6 +88,8 @@ type RequestRow = {
   created_at: string;
   request_kind?: string;
   model: string;
+  client_user_agent?: string;
+  stream?: boolean;
   proxy_uri?: string;
   status: string;
   status_code: number;
@@ -2708,6 +2710,7 @@ function Usage({
             <div className="table-head">
               <span>模型 / 完成时间</span>
               <span>请求结果</span>
+              <span>UA / 流式</span>
               <span>输入 Token</span>
               <span>输出 Token</span>
               <span>首字耗时</span>
@@ -2743,6 +2746,18 @@ function Usage({
                       {r.error_message}
                     </small>
                   )}
+                </div>
+                <div className="usage-client-cell">
+                  <span className="usage-client-name" title={r.client_user_agent || "未记录"}>
+                    {r.client_user_agent || "未记录"}
+                  </span>
+                  <span
+                    className={`stream-tag ${
+                      r.stream === true ? "streaming" : r.stream === false ? "non-streaming" : "unknown"
+                    }`}
+                  >
+                    {r.stream === true ? "流式" : r.stream === false ? "非流式" : "未记录"}
+                  </span>
                 </div>
                 <span className="usage-number">
                   {r.prompt_tokens === undefined ? "—" : fmt(r.prompt_tokens)}

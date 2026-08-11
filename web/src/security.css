@@ -1063,13 +1063,13 @@
   scrollbar-color: #c5c1b7 transparent;
 }
 .usage-table {
-  min-width: 1060px;
+  min-width: 1280px;
 }
 .usage-table .table-head,
 .usage-table .table-row {
   grid-template-columns:
-    minmax(220px, 1.7fr) minmax(120px, 0.8fr) minmax(88px, 0.58fr)
-    minmax(88px, 0.58fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr)
+    minmax(220px, 1.7fr) minmax(120px, 0.8fr) minmax(200px, 1.3fr)
+    minmax(88px, 0.58fr) minmax(88px, 0.58fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr)
     minmax(150px, 1fr);
 }
 .usage-table .table-row {
@@ -1086,6 +1086,38 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.usage-client-cell {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 5px;
+}
+.usage-client-name {
+  color: #465f50;
+  font: 600 11px Manrope, sans-serif;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.stream-tag {
+  justify-self: start;
+  border: 1px solid #d6d4cb;
+  border-radius: 3px;
+  padding: 2px 5px;
+  color: #71766e;
+  background: #f7f5ee;
+  font: 9px "DM Mono", monospace;
+  line-height: 1.1;
+}
+.stream-tag.streaming {
+  border-color: #9dc3ae;
+  color: #32664d;
+  background: #eaf4ec;
+}
+.stream-tag.non-streaming {
+  border-color: #b7c9d4;
+  color: #446273;
+  background: #eef5f8;
 }
 .usage-number,
 .usage-duration {
@@ -1216,8 +1248,8 @@
   .usage-table .table-head,
   .usage-table .table-row {
     grid-template-columns:
-      minmax(220px, 1.7fr) minmax(120px, 0.8fr) minmax(88px, 0.58fr)
-      minmax(88px, 0.58fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr)
+      minmax(220px, 1.7fr) minmax(120px, 0.8fr) minmax(200px, 1.3fr)
+      minmax(88px, 0.58fr) minmax(88px, 0.58fr) minmax(96px, 0.65fr) minmax(96px, 0.65fr)
       minmax(150px, 1fr);
   }
   .usage-table .table-head span:nth-child(3),

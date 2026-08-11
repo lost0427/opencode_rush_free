@@ -70,6 +70,7 @@ const (
 	usageRetentionSettingKey  = "usage_retention_days"
 	defaultUsageRetentionDays = 90
 	upstreamRequestTimeout    = 120 * time.Second
+	statusClientClosedRequest = 499
 )
 
 var (
@@ -134,6 +135,9 @@ type usageRequest struct {
 	ResolvedModel       string          `json:"resolved_model,omitempty"`
 	ClientKeyID         *int64          `json:"client_key_id,omitempty"`
 	ClientKeyName       string          `json:"client_key_name,omitempty"`
+	ClientName          string          `json:"client_name,omitempty"`
+	ClientUserAgent     string          `json:"client_user_agent,omitempty"`
+	Stream              *bool           `json:"stream,omitempty"`
 	ProxyID             *int64          `json:"proxy_id,omitempty"`
 	ProxyURI            string          `json:"proxy_uri,omitempty"`
 	Status              string          `json:"status"`
@@ -160,6 +164,7 @@ type chatEnvelope struct {
 	Model    string          `json:"model"`
 	User     json.RawMessage `json:"user"`
 	Messages []any           `json:"messages"`
+	Stream   bool            `json:"stream"`
 }
 
 func parseChatEnvelope(body []byte) (chatEnvelope, map[string]any, error) {
@@ -173,7 +178,8 @@ func parseChatEnvelope(body []byte) (chatEnvelope, map[string]any, error) {
 		return chatEnvelope{}, nil, errors.New("messages must be an array")
 	}
 	user, _ := json.Marshal(payload["user"])
-	return chatEnvelope{Model: model, User: user, Messages: messages}, payload, nil
+	stream, _ := payload["stream"].(bool)
+	return chatEnvelope{Model: model, User: user, Messages: messages, Stream: stream}, payload, nil
 }
 
 var defaultUpstreamHeaders = map[string]string{
@@ -235,7 +241,7 @@ func main() {
 	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
 		log.Fatal(err)
 	}
-	usageInsertStmt, err := db.Prepare("INSERT INTO usage_requests(created_at,request_kind,model,resolved_model,client_key_id,client_key_name,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message,error_origin,route_engine,attempt_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+	usageInsertStmt, err := db.Prepare("INSERT INTO usage_requests(created_at,request_kind,model,resolved_model,client_key_id,client_key_name,client_name,client_user_agent,stream,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message,error_origin,route_engine,attempt_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -359,7 +365,7 @@ func migrate(db *sql.DB) error {
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS proxies (id INTEGER PRIMARY KEY AUTOINCREMENT, uri TEXT UNIQUE NOT NULL, scheme TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, username TEXT, encrypted_password TEXT, enabled INTEGER NOT NULL DEFAULT 1, health_status TEXT NOT NULL DEFAULT 'unknown', failure_count INTEGER NOT NULL DEFAULT 0, cooldown_until TEXT, expires_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS models (id INTEGER PRIMARY KEY AUTOINCREMENT, model_id TEXT UNIQUE NOT NULL, display_name TEXT, is_free INTEGER NOT NULL, free_reason TEXT, pricing_metadata TEXT, raw_metadata TEXT, refreshed_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, resolved_model TEXT, client_key_id INTEGER, client_key_name TEXT, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT 'builtin', attempt_summary TEXT, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
+CREATE TABLE IF NOT EXISTS usage_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, request_kind TEXT NOT NULL DEFAULT 'chat', model TEXT NOT NULL, resolved_model TEXT, client_key_id INTEGER, client_key_name TEXT, client_name TEXT, client_user_agent TEXT, stream INTEGER, proxy_id INTEGER, proxy_uri TEXT, status TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, first_token_latency_ms INTEGER, retry_count INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, error_message TEXT, error_origin TEXT NOT NULL DEFAULT '', route_engine TEXT NOT NULL DEFAULT 'builtin', attempt_summary TEXT, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS session_proxy_routes (session_key TEXT PRIMARY KEY, proxy_id INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(proxy_id) REFERENCES proxies(id));
 CREATE TABLE IF NOT EXISTS resin_session_routes (session_key TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0, request_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS client_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, key_hint TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, expires_at TEXT, rpm_limit INTEGER NOT NULL DEFAULT 0, tpm_limit INTEGER NOT NULL DEFAULT 0, last_used_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -385,6 +391,9 @@ CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_requests(created_at); CREA
 		"ALTER TABLE usage_requests ADD COLUMN resolved_model TEXT",
 		"ALTER TABLE usage_requests ADD COLUMN client_key_id INTEGER",
 		"ALTER TABLE usage_requests ADD COLUMN client_key_name TEXT",
+		"ALTER TABLE usage_requests ADD COLUMN client_name TEXT",
+		"ALTER TABLE usage_requests ADD COLUMN client_user_agent TEXT",
+		"ALTER TABLE usage_requests ADD COLUMN stream INTEGER",
 		"ALTER TABLE usage_requests ADD COLUMN attempt_summary TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_probe_at TEXT",
 		"ALTER TABLE proxies ADD COLUMN last_probe_latency_ms INTEGER",
@@ -1665,6 +1674,10 @@ func clientCredential(r *http.Request) string {
 	return supplied
 }
 
+func usageClientUserAgent(r *http.Request) string {
+	return strings.TrimSpace(r.UserAgent())
+}
+
 func sessionKey(r *http.Request, user json.RawMessage) string {
 	sessionID := ""
 	for _, header := range []string{"X-Relay-Session-ID", "X-OpenCode-Session-ID", "X-Session-ID"} {
@@ -1713,6 +1726,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "model is required"})
 		return
 	}
+	clientUserAgent := usageClientUserAgent(r)
 	requestedModel := parsed.Model
 	resolvedModel, resolveErr := a.resolveModel(requestedModel)
 	if resolveErr != nil {
@@ -1747,7 +1761,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	if hasImage && !visionEnabled {
 		if known, supportsImage := a.cachedModelSupportsImage(resolvedModel); known && !supportsImage {
 			message := fmt.Sprintf("model %q only supports text input; choose a Free model with image support or remove image_url", requestedModel)
-			a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, nil, "", "direct", "error", http.StatusBadRequest, time.Since(start), nil, 0, nil, nil, errors.New(message))
+			a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, nil, "", "direct", "error", http.StatusBadRequest, time.Since(start), nil, 0, nil, nil, clientUserAgent, parsed.Stream, errors.New(message))
 			writeJSON(w, http.StatusBadRequest, map[string]string{
 				"error": message,
 				"code":  "unsupported_input_modality",
@@ -1775,12 +1789,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	} else {
 		proxies, err = a.availableProxies()
 		if err != nil {
-			a.recordGatewayUsageWithOrigin(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusInternalServerError, time.Since(start), nil, 0, nil, nil, errors.New("could not load proxies"), "internal")
+			a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusInternalServerError, time.Since(start), nil, 0, nil, nil, clientUserAgent, parsed.Stream, errors.New("could not load proxies"), "internal")
 			writeJSON(w, 500, map[string]string{"error": "could not load proxies"})
 			return
 		}
 		if len(proxies) == 0 {
-			a.recordGatewayUsageWithOrigin(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusServiceUnavailable, time.Since(start), nil, 0, nil, nil, errors.New("no healthy proxies available"), "internal")
+			a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusServiceUnavailable, time.Since(start), nil, 0, nil, nil, clientUserAgent, parsed.Stream, errors.New("no healthy proxies available"), "internal")
 			writeJSON(w, 503, map[string]string{"error": "no healthy proxies available"})
 			return
 		}
@@ -1801,10 +1815,17 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		attempts = len(proxies)
 	}
 	var lastErr error
+	var downstreamErr error
 	lastProxyURI := ""
+	retryCount := 0
 	used := map[int64]struct{}{}
 	attemptSummary := []map[string]any{}
 	for i := 0; i < attempts; i++ {
+		if requestErr := r.Context().Err(); requestErr != nil {
+			downstreamErr = requestErr
+			lastErr = requestErr
+			break
+		}
 		var p ProxyRecord
 		if resinMode {
 			p, err = resinRoute.proxy(a, engineConfig)
@@ -1824,6 +1845,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			used[p.ID] = struct{}{}
 		}
+		retryCount = i
 		lastProxyURI = p.URI
 		bodyToForward := forwardBody
 		if visionEnabled {
@@ -1933,6 +1955,11 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			lastErr = e
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
+			if requestErr := r.Context().Err(); requestErr != nil {
+				downstreamErr = requestErr
+				lastErr = requestErr
+				break
+			}
 			if resinMode {
 				a.resinFailure(e)
 				break
@@ -1976,7 +2003,8 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
 			if !waitForRetry(r.Context(), retryAfterDelay(resp, i)) {
-				lastErr = r.Context().Err()
+				downstreamErr = r.Context().Err()
+				lastErr = downstreamErr
 				break
 			}
 			continue
@@ -1999,12 +2027,25 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			requestError = errors.Join(requestError, copyErr)
 		}
 		attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
-		a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, requestError)
+		a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, clientUserAgent, parsed.Stream, requestError)
 		return
 	}
-	a.recordGatewayUsageWithOrigin(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", 502, time.Since(start), nil, attempts, nil, attemptSummary, lastErr, "internal")
-	writeJSON(w, 502, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
+	lastErr, finalStatus, origin := terminalGatewayFailure(downstreamErr, lastErr)
+	a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", finalStatus, time.Since(start), nil, retryCount, nil, attemptSummary, clientUserAgent, parsed.Stream, lastErr, origin)
+	writeJSON(w, finalStatus, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
 }
+
+func terminalGatewayFailure(requestErr, routeErr error) (error, int, string) {
+	if requestErr != nil {
+		status := statusClientClosedRequest
+		if errors.Is(requestErr, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		return requestErr, status, "external"
+	}
+	return routeErr, http.StatusBadGateway, "internal"
+}
+
 func lastErrString(e error) string {
 	if e == nil {
 		return ""
@@ -3442,7 +3483,7 @@ func usageErrorOrigin(kind, status string, code int, message string) string {
 		return "internal"
 	}
 	lower := strings.ToLower(strings.TrimSpace(message))
-	if code == 0 || code == 499 || code >= http.StatusInternalServerError || code == http.StatusUnavailableForLegalReasons {
+	if code == 0 || code == statusClientClosedRequest || code >= http.StatusInternalServerError || code == http.StatusUnavailableForLegalReasons {
 		return "external"
 	}
 	for _, marker := range []string{
@@ -3468,7 +3509,7 @@ func usageErrorOrigin(kind, status string, code int, message string) string {
 }
 
 const usageOriginSQL = "COALESCE(NULLIF(u.error_origin,''),'user')"
-const usageSelect = "SELECT u.id,u.created_at,COALESCE(u.request_kind,'chat'),u.model,COALESCE(u.resolved_model,''),u.client_key_id,COALESCE(u.client_key_name,''),u.proxy_id,COALESCE(NULLIF(u.proxy_uri,''),p.uri,''),u.status,u.status_code,u.latency_ms,u.first_token_latency_ms,u.retry_count,u.prompt_tokens,u.completion_tokens,u.total_tokens,COALESCE(u.error_message,'')," + usageOriginSQL + ",COALESCE(NULLIF(u.route_engine,''),'builtin'),COALESCE(u.attempt_summary,'') FROM usage_requests u LEFT JOIN proxies p ON p.id=u.proxy_id"
+const usageSelect = "SELECT u.id,u.created_at,COALESCE(u.request_kind,'chat'),u.model,COALESCE(u.resolved_model,''),u.client_key_id,COALESCE(u.client_key_name,''),COALESCE(u.client_name,''),COALESCE(u.client_user_agent,''),u.stream,u.proxy_id,COALESCE(NULLIF(u.proxy_uri,''),p.uri,''),u.status,u.status_code,u.latency_ms,u.first_token_latency_ms,u.retry_count,u.prompt_tokens,u.completion_tokens,u.total_tokens,COALESCE(u.error_message,'')," + usageOriginSQL + ",COALESCE(NULLIF(u.route_engine,''),'builtin'),COALESCE(u.attempt_summary,'') FROM usage_requests u LEFT JOIN proxies p ON p.id=u.proxy_id"
 
 func (a *App) usageList(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
@@ -3606,10 +3647,15 @@ func (a *App) queryUsageRequests(query string, args ...any) ([]usageRequest, err
 	for rows.Next() {
 		var x usageRequest
 		var ts, attempts string
-		if err := rows.Scan(&x.ID, &ts, &x.RequestKind, &x.Model, &x.ResolvedModel, &x.ClientKeyID, &x.ClientKeyName, &x.ProxyID, &x.ProxyURI, &x.Status, &x.StatusCode, &x.LatencyMS, &x.FirstTokenLatencyMS, &x.RetryCount, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.ErrorMessage, &x.ErrorOrigin, &x.RouteEngine, &attempts); err != nil {
+		var stream sql.NullBool
+		if err := rows.Scan(&x.ID, &ts, &x.RequestKind, &x.Model, &x.ResolvedModel, &x.ClientKeyID, &x.ClientKeyName, &x.ClientName, &x.ClientUserAgent, &stream, &x.ProxyID, &x.ProxyURI, &x.Status, &x.StatusCode, &x.LatencyMS, &x.FirstTokenLatencyMS, &x.RetryCount, &x.PromptTokens, &x.CompletionTokens, &x.TotalTokens, &x.ErrorMessage, &x.ErrorOrigin, &x.RouteEngine, &attempts); err != nil {
 			return nil, err
 		}
 		x.CreatedAt, _ = time.Parse(time.RFC3339, ts)
+		if stream.Valid {
+			value := stream.Bool
+			x.Stream = &value
+		}
 		if attempts != "" {
 			x.AttemptSummary = json.RawMessage(attempts)
 		}

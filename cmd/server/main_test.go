@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -62,7 +63,7 @@ func insertUsageAt(t *testing.T, a *App, createdAt time.Time, model, status stri
 	}
 }
 
-func TestMigrateAddsFirstTokenLatencyToExistingUsageTable(t *testing.T) {
+func TestMigrateAddsNullableUsageColumnsToExistingUsageTable(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:legacy-usage-migration?mode=memory&cache=shared")
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +92,10 @@ func TestMigrateAddsFirstTokenLatencyToExistingUsageTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	found := false
+	foundFirstTokenLatency := false
+	foundClientName := false
+	foundClientUserAgent := false
+	foundStream := false
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -100,14 +104,105 @@ func TestMigrateAddsFirstTokenLatencyToExistingUsageTable(t *testing.T) {
 			t.Fatal(err)
 		}
 		if name == "first_token_latency_ms" {
-			found = true
+			foundFirstTokenLatency = true
 			if notNull != 0 {
 				t.Fatal("first_token_latency_ms must remain nullable for historical rows")
 			}
 		}
+		if name == "stream" {
+			foundStream = true
+			if notNull != 0 {
+				t.Fatal("stream must remain nullable for historical rows")
+			}
+		}
+		if name == "client_name" {
+			foundClientName = true
+			if notNull != 0 {
+				t.Fatal("client_name must remain nullable for historical rows")
+			}
+		}
+		if name == "client_user_agent" {
+			foundClientUserAgent = true
+			if notNull != 0 {
+				t.Fatal("client_user_agent must remain nullable for historical rows")
+			}
+		}
 	}
-	if !found {
+	if !foundFirstTokenLatency {
 		t.Fatal("migration did not add first_token_latency_ms")
+	}
+	if !foundStream {
+		t.Fatal("migration did not add stream")
+	}
+	if !foundClientName {
+		t.Fatal("migration did not add client_name")
+	}
+	if !foundClientUserAgent {
+		t.Fatal("migration did not add client_user_agent")
+	}
+}
+
+func TestParseChatEnvelopeReadsStream(t *testing.T) {
+	streaming, _, err := parseChatEnvelope([]byte(`{"model":"model:free","messages":[],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !streaming.Stream {
+		t.Fatal("stream=true was not parsed")
+	}
+	nonStreaming, _, err := parseChatEnvelope([]byte(`{"model":"model:free","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nonStreaming.Stream {
+		t.Fatal("an omitted stream field must be recorded as non-streaming")
+	}
+}
+
+func TestUsageClientUserAgent(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("User-Agent", "claude-code/2.0.0 (darwin; arm64)")
+	if got, want := usageClientUserAgent(r), "claude-code/2.0.0 (darwin; arm64)"; got != want {
+		t.Fatalf("usageClientUserAgent() = %q, want %q", got, want)
+	}
+}
+
+func TestUsageListIncludesClientAndStreamState(t *testing.T) {
+	a := testApp(t)
+	a.recordGatewayUsageWithStream(&ClientKey{ID: 1, Name: "build-agent"}, "stream:free", "stream:free", nil, "", "direct", "success", http.StatusOK, time.Second, nil, 0, nil, nil, "claude-code/2.0.0 (darwin; arm64)", true, nil)
+	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,status,status_code,latency_ms,retry_count) VALUES(?,?,?,?,?,?,?)", time.Now().UTC().Format(time.RFC3339), "chat", "legacy:free", "success", http.StatusOK, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	a.usageList(recorder, httptest.NewRequest(http.MethodGet, "/api/usage/requests?page=1&page_size=25", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("usage list failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Items []usageRequest `json:"items"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 2 {
+		t.Fatalf("usage item count = %d, want 2", len(response.Items))
+	}
+
+	var streaming, legacy *usageRequest
+	for i := range response.Items {
+		switch response.Items[i].Model {
+		case "stream:free":
+			streaming = &response.Items[i]
+		case "legacy:free":
+			legacy = &response.Items[i]
+		}
+	}
+	if streaming == nil || streaming.ClientUserAgent != "claude-code/2.0.0 (darwin; arm64)" || streaming.Stream == nil || !*streaming.Stream {
+		t.Fatalf("streaming usage was not returned with its client and stream state: %#v", streaming)
+	}
+	if legacy == nil || legacy.ClientUserAgent != "" || legacy.Stream != nil {
+		t.Fatalf("legacy usage must retain an unknown stream state: %#v", legacy)
 	}
 }
 
@@ -344,6 +439,112 @@ func TestProxyPoolFailureCountsTowardModelSuccessRate(t *testing.T) {
 	}
 	if len(stats) != 1 || stats[0].Requests != 2 || stats[0].Success != 1 || stats[0].ExternalErrors != 0 || stats[0].SuccessRate != 0.5 {
 		t.Fatalf("proxy pool failure was not counted: %#v", stats)
+	}
+}
+
+func TestCanceledGatewayRequestIsExternalAndDoesNotPenalizeResin(t *testing.T) {
+	a := testApp(t)
+	proxyStarted := make(chan struct{}, 1)
+	releaseProxy := make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case proxyStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+		case <-releaseProxy:
+		}
+	}))
+	defer func() {
+		close(releaseProxy)
+		proxy.Close()
+	}()
+
+	upstream := httptest.NewRecorder()
+	a.putUpstream(upstream, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"http://upstream.example.test"}`)))
+	if upstream.Code != http.StatusOK {
+		t.Fatalf("configure upstream failed: %d %s", upstream.Code, upstream.Body.String())
+	}
+	engine := httptest.NewRecorder()
+	a.putProxyEngine(engine, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(`{"engine":"resin","resin_gateway_url":"`+proxy.URL+`","resin_platform":"Default","resin_proxy_token":"proxy-token"}`)))
+	if engine.Code != http.StatusOK {
+		t.Fatalf("configure Resin failed: %d %s", engine.Code, engine.Body.String())
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "cancel:free", "Cancel", 1, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("UPDATE settings SET value=? WHERE key='client_key'", hashToken("cancel-test-client")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.migrateLegacyClientKey(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"cancel:free","messages":[{"role":"user","content":"hello"}]}`)).WithContext(ctx)
+	request.Header.Set("Authorization", "Bearer cancel-test-client")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		a.gatewayChat(response, request)
+		close(done)
+	}()
+
+	select {
+	case <-proxyStarted:
+		cancel()
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("gateway request did not reach the Resin proxy")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gateway did not stop after client cancellation")
+	}
+
+	var origin, message string
+	var statusCode, retryCount int
+	if err := a.db.QueryRow("SELECT error_origin,status_code,retry_count,COALESCE(error_message,'') FROM usage_requests WHERE request_kind='chat' ORDER BY id DESC LIMIT 1").Scan(&origin, &statusCode, &retryCount, &message); err != nil {
+		t.Fatal(err)
+	}
+	if origin != "external" || statusCode != statusClientClosedRequest || retryCount != 0 || message != context.Canceled.Error() {
+		t.Fatalf("canceled request was misclassified: origin=%q status=%d retries=%d message=%q", origin, statusCode, retryCount, message)
+	}
+	a.resinMu.Lock()
+	resinFailures := a.resinFailureCount
+	a.resinMu.Unlock()
+	if resinFailures != 0 {
+		t.Fatalf("client cancellation penalized Resin: failures=%d", resinFailures)
+	}
+
+	statusRecorder := httptest.NewRecorder()
+	a.publicStatus(statusRecorder, httptest.NewRequest(http.MethodGet, "/api/public/status", nil))
+	if statusRecorder.Code != http.StatusOK {
+		t.Fatalf("public status failed: %d %s", statusRecorder.Code, statusRecorder.Body.String())
+	}
+	var statusPayload struct {
+		Models []publicModelStatus `json:"models"`
+	}
+	if err := json.NewDecoder(statusRecorder.Body).Decode(&statusPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(statusPayload.Models) != 1 || statusPayload.Models[0].ExternalErrors24h != 1 || statusPayload.Models[0].SuccessRate != nil {
+		t.Fatalf("canceled request affected public availability: %#v", statusPayload.Models)
+	}
+}
+
+func TestTerminalGatewayFailureRequiresObservedDownstreamCancellation(t *testing.T) {
+	routeErr := fmt.Errorf("proxy transport: %w", context.Canceled)
+	gotErr, status, origin := terminalGatewayFailure(nil, routeErr)
+	if !errors.Is(gotErr, context.Canceled) || status != http.StatusBadGateway || origin != "internal" {
+		t.Fatalf("proxy cancellation was excluded: err=%v status=%d origin=%q", gotErr, status, origin)
+	}
+	gotErr, status, origin = terminalGatewayFailure(context.Canceled, routeErr)
+	if !errors.Is(gotErr, context.Canceled) || status != statusClientClosedRequest || origin != "external" {
+		t.Fatalf("downstream cancellation was counted: err=%v status=%d origin=%q", gotErr, status, origin)
 	}
 }
 

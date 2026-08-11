@@ -490,10 +490,18 @@ func (a *App) rotateClientKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) recordGatewayUsage(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, requestErr error) {
-	a.recordGatewayUsageWithOrigin(key, requestedModel, resolvedModel, proxyID, proxyURI, engine, status, code, latency, firstToken, retries, tokens, attempts, requestErr, "")
+	a.recordGatewayUsageWithStream(key, requestedModel, resolvedModel, proxyID, proxyURI, engine, status, code, latency, firstToken, retries, tokens, attempts, "", false, requestErr)
+}
+
+func (a *App) recordGatewayUsageWithStream(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, clientUserAgent string, stream bool, requestErr error) {
+	a.recordGatewayUsageWithOriginAndStream(key, requestedModel, resolvedModel, proxyID, proxyURI, engine, status, code, latency, firstToken, retries, tokens, attempts, clientUserAgent, stream, requestErr, "")
 }
 
 func (a *App) recordGatewayUsageWithOrigin(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, requestErr error, originOverride string) {
+	a.recordGatewayUsageWithOriginAndStream(key, requestedModel, resolvedModel, proxyID, proxyURI, engine, status, code, latency, firstToken, retries, tokens, attempts, "", false, requestErr, originOverride)
+}
+
+func (a *App) recordGatewayUsageWithOriginAndStream(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, clientUserAgent string, stream bool, requestErr error, originOverride string) {
 	var prompt, completion, total *int64
 	if tokens != nil {
 		prompt, completion, total = tokens.Prompt, tokens.Completion, tokens.Total
@@ -517,12 +525,12 @@ func (a *App) recordGatewayUsageWithOrigin(key *ClientKey, requestedModel, resol
 	if originOverride != "" {
 		origin = originOverride
 	}
-	args := []any{time.Now().UTC().Format(time.RFC3339), "chat", requestedModel, resolvedModel, keyID, keyName, proxy, proxyURI, status, code, latency.Milliseconds(), firstMS, retries, prompt, completion, total, lastErrString(requestErr), origin, engine, string(encoded)}
+	args := []any{time.Now().UTC().Format(time.RFC3339), "chat", requestedModel, resolvedModel, keyID, keyName, "", clientUserAgent, stream, proxy, proxyURI, status, code, latency.Milliseconds(), firstMS, retries, prompt, completion, total, lastErrString(requestErr), origin, engine, string(encoded)}
 	var err error
 	if a.usageInsertStmt != nil {
 		_, err = a.usageInsertStmt.Exec(args...)
 	} else {
-		_, err = a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,resolved_model,client_key_id,client_key_name,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message,error_origin,route_engine,attempt_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args...)
+		_, err = a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,resolved_model,client_key_id,client_key_name,client_name,client_user_agent,stream,proxy_id,proxy_uri,status,status_code,latency_ms,first_token_latency_ms,retry_count,prompt_tokens,completion_tokens,total_tokens,error_message,error_origin,route_engine,attempt_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", args...)
 	}
 	if err != nil {
 		log.Printf("record gateway usage failed: %v", err)
