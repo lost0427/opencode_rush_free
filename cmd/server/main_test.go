@@ -323,6 +323,30 @@ func TestUsageErrorOriginClassifiesProviderAndInternalFailures(t *testing.T) {
 	}
 }
 
+func TestProxyPoolFailureCountsTowardModelSuccessRate(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "pool:free", "Pool", 1, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	a.recordGatewayUsageWithOrigin(nil, "pool:free", "pool:free", nil, "", "builtin", "error", http.StatusBadGateway, time.Second, nil, 3, nil, nil, errors.New("proxyconnect tcp: i/o timeout"), "internal")
+	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,status,status_code,latency_ms,retry_count,error_origin) VALUES(?,?,?,?,?,?,?,?)", now, "chat", "pool:free", "success", http.StatusOK, 100, 0, "none"); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	a.statsModels(recorder, httptest.NewRequest(http.MethodGet, "/api/stats/models?window=24h", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("stats request failed: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var stats []dimensionStat
+	if err := json.NewDecoder(recorder.Body).Decode(&stats); err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 1 || stats[0].Requests != 2 || stats[0].Success != 1 || stats[0].ExternalErrors != 0 || stats[0].SuccessRate != 0.5 {
+		t.Fatalf("proxy pool failure was not counted: %#v", stats)
+	}
+}
+
 func TestBackfillUsageErrorOriginsClassifiesExistingRecords(t *testing.T) {
 	a := testApp(t)
 	if _, err := a.db.Exec("INSERT INTO usage_requests(created_at,request_kind,model,status,status_code,latency_ms,retry_count,error_message) VALUES(?,?,?,?,?,?,?,?)", time.Now().UTC().Format(time.RFC3339), "chat", "model:free", "error", http.StatusBadGateway, 1, 0, "Post upstream: context canceled"); err != nil {

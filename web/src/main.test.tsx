@@ -13,6 +13,36 @@ const summary = {
   free_models: 0, active_proxies: 0,
 };
 
+const publicStatus = {
+  generated_at: "2026-08-11T07:00:00Z",
+  timezone: "Asia/Shanghai",
+  window_start: "2026-08-10T07:00:00Z",
+  window_end: "2026-08-11T07:00:00Z",
+  bucket_hours: 24,
+  summary: { models: 1, requests_24h: 24, recent_requests_15m: 2, success_rate: 0.95, status: "available" },
+  models: [{
+    model_id: "alpha:free",
+    display_name: "Alpha",
+    admin_enabled: true,
+    requests_24h: 24,
+    recent_requests_15m: 2,
+    success_24h: 23,
+    external_errors_24h: 0,
+    success_rate: 0.9583,
+    avg_latency_ms: 33900,
+    avg_first_token_latency_ms: 21600,
+    status: "available",
+    buckets: Array.from({ length: 24 }, (_, index) => ({
+      start: new Date(Date.UTC(2026, 7, 10, 7 + index)).toISOString(),
+      requests: index === 23 ? 2 : 1,
+      success: 1,
+      external_errors: 0,
+      success_rate: 1,
+      status: "available",
+    })),
+  }],
+};
+
 beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn());
   vi.stubGlobal("confirm", vi.fn(() => true));
@@ -52,6 +82,24 @@ describe("console feedback", () => {
     render(<App />);
     const toast = await screen.findByText("部分控制台数据未能刷新");
     expect(toast.closest(".toast")).toHaveClass("warning");
+  });
+});
+
+describe("public model status", () => {
+  it("loads without an admin session and renders every hourly cell", async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/public/status") return json(publicStatus);
+      return json({ error: "unexpected request" }, 500);
+    });
+    history.replaceState(null, "", "/status");
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "全部模型" })).toBeInTheDocument();
+    expect(screen.getByText("Alpha")).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(24);
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    expect(vi.mocked(fetch)).toHaveBeenCalledWith("/api/public/status", expect.objectContaining({ credentials: "omit" }));
+    expect(vi.mocked(fetch)).not.toHaveBeenCalledWith("/api/auth/me", expect.anything());
   });
 });
 

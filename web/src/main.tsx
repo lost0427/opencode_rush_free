@@ -182,6 +182,44 @@ type DimensionStat = {
   p50_first_token_latency_ms: number;
   p95_first_token_latency_ms: number;
 };
+type PublicStatusState = "available" | "degraded" | "outage" | "no_request";
+type PublicStatusBucket = {
+  start: string;
+  requests: number;
+  success: number;
+  external_errors: number;
+  success_rate: number | null;
+  status: PublicStatusState;
+};
+type PublicModelStatus = {
+  model_id: string;
+  display_name: string;
+  admin_enabled: boolean;
+  requests_24h: number;
+  recent_requests_15m: number;
+  success_24h: number;
+  external_errors_24h: number;
+  success_rate: number | null;
+  avg_latency_ms: number;
+  avg_first_token_latency_ms: number;
+  status: PublicStatusState;
+  buckets: PublicStatusBucket[];
+};
+type PublicStatusResponse = {
+  generated_at: string;
+  timezone: string;
+  window_start: string;
+  window_end: string;
+  bucket_hours: number;
+  summary: {
+    models: number;
+    requests_24h: number;
+    recent_requests_15m: number;
+    success_rate: number | null;
+    status: PublicStatusState;
+  };
+  models: PublicModelStatus[];
+};
 type ProxyFilterState = "all" | "unused" | "in_use" | "cooldown";
 type UsageTimePreset = "all" | "1h" | "24h" | "7d" | "30d" | "custom";
 type StatsWindow = "1h" | "24h" | "7d" | "30d";
@@ -214,6 +252,15 @@ const api = async (path: string, init: RequestInit = {}) => {
   }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || "请求失败");
+  return data;
+};
+const publicApi = async (path: string) => {
+  const r = await fetch(path, {
+    credentials: "omit",
+    headers: { "Content-Type": "application/json" },
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "状态数据暂时不可用");
   return data;
 };
 const fmt = (n: number) => new Intl.NumberFormat("zh-CN").format(n || 0);
@@ -291,7 +338,193 @@ function Login({ onLogin }: { onLogin: () => void }) {
   );
 }
 
+const publicStatusLabels: Record<PublicStatusState, string> = {
+  available: "可用",
+  degraded: "降级",
+  outage: "异常",
+  no_request: "无请求",
+};
+
+const publicStatusTime = new Intl.DateTimeFormat("zh-CN", {
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+  timeZone: "Asia/Shanghai",
+});
+
+const publicStatusRate = (value: number | null) =>
+  value === null || value === undefined ? "—" : `${(value * 100).toFixed(2)}%`;
+
+const publicStatusDuration = (value: number) =>
+  value > 0 ? formatDuration(value) : "—";
+
+function PublicStatusPage() {
+  const [data, setData] = useState<PublicStatusResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const previousTitle = document.title;
+    document.title = "模型状态 · Relay Desk";
+    return () => {
+      document.title = previousTitle;
+    };
+  }, []);
+  const load = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const next = (await publicApi("/api/public/status")) as PublicStatusResponse;
+      setData(next);
+      setError("");
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    const timer = window.setInterval(refreshWhenVisible, 60_000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [load]);
+
+  const statusClass = (status: PublicStatusState) =>
+    `public-status-state ${status}`;
+  const statusText = (status: PublicStatusState) =>
+    publicStatusLabels[status] || publicStatusLabels.no_request;
+  const timeText = (raw: string) => {
+    const date = new Date(raw);
+    return Number.isNaN(date.getTime()) ? "—" : publicStatusTime.format(date);
+  };
+
+  return (
+    <div className="public-status-shell">
+      <header className="public-status-header">
+        <a className="public-status-brand" href="/" aria-label="Relay Desk 控制台">
+          <span className="public-status-brand-icon">R</span>
+          <span>
+            <strong>Relay Desk</strong>
+            <small>MODEL AVAILABILITY</small>
+          </span>
+        </a>
+        <div className="public-status-header-actions">
+          <span className="public-status-live"><i />实时数据</span>
+          <button
+            className="icon-btn"
+            type="button"
+            title="刷新状态"
+            aria-label="刷新状态"
+            onClick={() => void load()}
+            disabled={refreshing}
+          >
+            <RefreshCw size={16} className={refreshing ? "spin" : ""} />
+          </button>
+          <a className="public-status-console-link" href="/">进入控制台 <ArrowUpRight size={14} /></a>
+        </div>
+      </header>
+      <main className="public-status-main">
+        <div className="public-status-intro">
+          <div>
+            <span className="eyebrow">MODEL STATUS</span>
+            <h1>全部模型</h1>
+            <p>近 24 小时每小时状态</p>
+          </div>
+          {data && (
+            <div className="public-status-summary">
+              <span>{data.summary.models} 个 Free 模型</span>
+              <strong>{publicStatusRate(data.summary.success_rate)}</strong>
+              <small>24h 整体成功率</small>
+            </div>
+          )}
+        </div>
+        {error && (
+          <div className="public-status-error" role="alert">
+            <TriangleAlert size={16} />
+            <span>{error}</span>
+            <button type="button" onClick={() => void load()}>重试</button>
+          </div>
+        )}
+        {loading && !data ? (
+          <div className="public-status-loading"><CircleGauge className="spin" size={19} />正在读取模型状态</div>
+        ) : data && data.models.length > 0 ? (
+          <div className="public-status-list">
+            {data.models.map((model) => (
+              <article className="public-status-card" key={model.model_id}>
+                <div className="public-status-card-head">
+                  <div className="public-model-identity">
+                    <span className={`public-status-mark ${model.status}`} aria-hidden="true" />
+                    <div>
+                      <div className="public-model-title">
+                        <strong>{model.display_name}</strong>
+                        {!model.admin_enabled && <span className="public-disabled-tag">已停用</span>}
+                      </div>
+                      <small>{model.model_id}</small>
+                    </div>
+                  </div>
+                  <div className="public-model-overall">
+                    <span className={statusClass(model.status)}><i />{statusText(model.status)}</span>
+                    <strong>{publicStatusRate(model.success_rate)}</strong>
+                    <small>24h 成功率</small>
+                  </div>
+                </div>
+                <div className="public-status-strip-wrap">
+                  <div className="public-status-strip" role="list" aria-label={`${model.display_name} 近 24 小时状态`}>
+                    {model.buckets.map((bucket) => (
+                      <span
+                        key={bucket.start}
+                        className={`public-status-cell ${bucket.status}`}
+                        role="listitem"
+                        title={`${timeText(bucket.start)} · ${statusText(bucket.status)} · ${fmt(bucket.requests)} 请求 · ${publicStatusRate(bucket.success_rate)}`}
+                        aria-label={`${timeText(bucket.start)}，${statusText(bucket.status)}，${fmt(bucket.requests)} 请求，成功率 ${publicStatusRate(bucket.success_rate)}`}
+                      />
+                    ))}
+                  </div>
+                  <div className="public-status-axis">
+                    <span>{timeText(model.buckets[0]?.start || data.window_start)}</span>
+                    <span>近 24 小时</span>
+                    <span>{timeText(model.buckets[model.buckets.length - 1]?.start || data.window_end)}</span>
+                  </div>
+                </div>
+                <div className="public-status-metrics">
+                  <div><span>24h 请求</span><strong>{fmt(model.requests_24h)}</strong></div>
+                  <div><span>近 15 分钟</span><strong>{fmt(model.recent_requests_15m)}</strong></div>
+                  <div><span>平均首字</span><strong>{publicStatusDuration(model.avg_first_token_latency_ms)}</strong></div>
+                  <div><span>平均耗时</span><strong>{publicStatusDuration(model.avg_latency_ms)}</strong></div>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : data ? (
+          <div className="public-status-empty">暂时没有 Free 模型</div>
+        ) : null}
+        {data && (
+          <footer className="public-status-footer">
+            <div className="public-status-legend">
+              {(["available", "degraded", "outage", "no_request"] as PublicStatusState[]).map((status) => (
+                <span key={status}><i className={`public-status-cell ${status}`} />{statusText(status)} {status === "available" ? "≥95%" : status === "degraded" ? "80–95%" : status === "outage" ? "<80%" : ""}</span>
+              ))}
+            </div>
+            <small>更新于 {timeText(data.generated_at)} · 数据时区 Asia/Shanghai</small>
+          </footer>
+        )}
+      </main>
+    </div>
+  );
+}
+
 function App() {
+  if (location.pathname === "/status") return <PublicStatusPage />;
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [page, setPage] = useState(() => {
     const view = new URLSearchParams(location.search).get("view");
@@ -472,6 +705,10 @@ function Console({
             <h2>{nav.find((n) => n[0] === page)?.[2]}</h2>
           </div>
           <div className="header-actions">
+            <a className="console-status-link" href="/status" title="打开公开模型状态页">
+              <Radio size={14} />
+              状态页
+            </a>
             <span className="endpoint">
               <span className="dot green" /> :8080 /v1
             </span>

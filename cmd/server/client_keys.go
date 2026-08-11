@@ -490,6 +490,10 @@ func (a *App) rotateClientKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) recordGatewayUsage(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, requestErr error) {
+	a.recordGatewayUsageWithOrigin(key, requestedModel, resolvedModel, proxyID, proxyURI, engine, status, code, latency, firstToken, retries, tokens, attempts, requestErr, "")
+}
+
+func (a *App) recordGatewayUsageWithOrigin(key *ClientKey, requestedModel, resolvedModel string, proxyID *int64, proxyURI, engine, status string, code int, latency time.Duration, firstToken *time.Duration, retries int, tokens *tokenUsage, attempts any, requestErr error, originOverride string) {
 	var prompt, completion, total *int64
 	if tokens != nil {
 		prompt, completion, total = tokens.Prompt, tokens.Completion, tokens.Total
@@ -509,7 +513,11 @@ func (a *App) recordGatewayUsage(key *ClientKey, requestedModel, resolvedModel s
 		keyName = key.Name
 	}
 	encoded, _ := json.Marshal(attempts)
-	args := []any{time.Now().UTC().Format(time.RFC3339), "chat", requestedModel, resolvedModel, keyID, keyName, proxy, proxyURI, status, code, latency.Milliseconds(), firstMS, retries, prompt, completion, total, lastErrString(requestErr), usageErrorOrigin("chat", status, code, lastErrString(requestErr)), engine, string(encoded)}
+	origin := usageErrorOrigin("chat", status, code, lastErrString(requestErr))
+	if originOverride != "" {
+		origin = originOverride
+	}
+	args := []any{time.Now().UTC().Format(time.RFC3339), "chat", requestedModel, resolvedModel, keyID, keyName, proxy, proxyURI, status, code, latency.Milliseconds(), firstMS, retries, prompt, completion, total, lastErrString(requestErr), origin, engine, string(encoded)}
 	var err error
 	if a.usageInsertStmt != nil {
 		_, err = a.usageInsertStmt.Exec(args...)

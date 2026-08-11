@@ -678,6 +678,7 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/stats/timeseries", a.requireAdmin(a.statsTimeseries))
 	mux.HandleFunc("GET /api/stats/models", a.requireAdmin(a.statsModels))
 	mux.HandleFunc("GET /api/stats/proxies", a.requireAdmin(a.statsProxies))
+	mux.HandleFunc("GET /api/public/status", a.publicStatus)
 	mux.HandleFunc("GET /api/usage/requests", a.requireAdmin(a.usageList))
 	mux.HandleFunc("GET /api/usage/rates", a.requireAdmin(a.usageRates))
 	mux.HandleFunc("GET /api/settings/probes", a.requireAdmin(a.getProbeSettings))
@@ -1774,10 +1775,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	} else {
 		proxies, err = a.availableProxies()
 		if err != nil {
+			a.recordGatewayUsageWithOrigin(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusInternalServerError, time.Since(start), nil, 0, nil, nil, errors.New("could not load proxies"), "internal")
 			writeJSON(w, 500, map[string]string{"error": "could not load proxies"})
 			return
 		}
 		if len(proxies) == 0 {
+			a.recordGatewayUsageWithOrigin(clientKey, requestedModel, resolvedModel, nil, "", "builtin", "error", http.StatusServiceUnavailable, time.Since(start), nil, 0, nil, nil, errors.New("no healthy proxies available"), "internal")
 			writeJSON(w, 503, map[string]string{"error": "no healthy proxies available"})
 			return
 		}
@@ -1999,7 +2002,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, requestError)
 		return
 	}
-	a.recordGatewayUsage(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", 502, time.Since(start), nil, attempts, nil, attemptSummary, lastErr)
+	a.recordGatewayUsageWithOrigin(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", 502, time.Since(start), nil, attempts, nil, attemptSummary, lastErr, "internal")
 	writeJSON(w, 502, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
 }
 func lastErrString(e error) string {
