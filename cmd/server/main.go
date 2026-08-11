@@ -709,6 +709,11 @@ func (a *App) withMiddleware(next http.Handler) http.Handler {
 func serveSPA(dir string) http.HandlerFunc {
 	fs := http.FileServer(http.Dir(dir))
 	return func(w http.ResponseWriter, r *http.Request) {
+		if isAPINamespace(r.URL.Path) {
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+			return
+		}
 		p := filepath.Join(dir, filepath.Clean(r.URL.Path))
 		if r.URL.Path != "/" {
 			if _, err := os.Stat(p); err == nil {
@@ -718,6 +723,10 @@ func serveSPA(dir string) http.HandlerFunc {
 		}
 		http.ServeFile(w, r, filepath.Join(dir, "index.html"))
 	}
+}
+
+func isAPINamespace(path string) bool {
+	return path == "/api" || strings.HasPrefix(path, "/api/") || path == "/v1" || strings.HasPrefix(path, "/v1/")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

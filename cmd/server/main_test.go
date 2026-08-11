@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -881,6 +883,101 @@ func TestAdminImportRefreshAndGatewayModels(t *testing.T) {
 			t.Fatalf("gateway %s authentication failed: %v status=%d", headerName, compatErr, compatResp.StatusCode)
 		}
 		_ = compatResp.Body.Close()
+	}
+}
+
+func TestGatewayRoutesBypassSPAFallback(t *testing.T) {
+	a := testApp(t)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer proxyServer.Close()
+
+	upstream := httptest.NewRecorder()
+	a.putUpstream(upstream, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"http://upstream.example.test"}`)))
+	if upstream.Code != http.StatusOK {
+		t.Fatalf("configure upstream failed: %d: %s", upstream.Code, upstream.Body.String())
+	}
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "alpha:free", "Alpha", 1, "test", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := parseProxy(proxyServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.insertProxy(proxy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("UPDATE settings SET value=? WHERE key='client_key'", hashToken("route-test-client")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.migrateLegacyClientKey(); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	a.routes(mux)
+	server := httptest.NewServer(a.withMiddleware(mux))
+	defer server.Close()
+	client := server.Client()
+
+	modelsReq, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+	modelsReq.Header.Set("Authorization", "Bearer route-test-client")
+	modelsResp, err := client.Do(modelsReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = modelsResp.Body.Close()
+	if modelsResp.StatusCode != http.StatusOK {
+		t.Fatalf("models route was intercepted by SPA fallback: %d", modelsResp.StatusCode)
+	}
+
+	chatReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/chat/completions", strings.NewReader(`{"model":"alpha:free","messages":[{"role":"user","content":"hello"}]}`))
+	chatReq.Header.Set("Authorization", "Bearer route-test-client")
+	chatReq.Header.Set("Content-Type", "application/json")
+	chatResp, err := client.Do(chatReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chatResp.Body.Close()
+	if chatResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(chatResp.Body)
+		t.Fatalf("chat route was intercepted by SPA fallback: %d: %s", chatResp.StatusCode, body)
+	}
+}
+
+func TestServeSPARejectsUnknownAPIRoutes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>relay desk</html>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := serveSPA(dir)
+
+	for _, path := range []string{"/v1", "/v1/", "/v1/unknown", "/api", "/api/unknown"} {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			if recorder.Code != http.StatusNotFound {
+				t.Fatalf("expected API path to return 404, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if contentType := recorder.Header().Get("Content-Type"); contentType != "application/json" {
+				t.Fatalf("expected JSON response, got %q", contentType)
+			}
+			if strings.Contains(recorder.Body.String(), "relay desk") {
+				t.Fatal("API path returned the SPA index")
+			}
+		})
+	}
+
+	for _, path := range []string{"/", "/settings", "/v10"} {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "relay desk") {
+				t.Fatalf("expected SPA route to return the index, got %d: %s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 
