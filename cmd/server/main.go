@@ -2266,7 +2266,10 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 	return a.proxyRuntime.clientFor(a, p)
 }
 
-func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, *http.Transport, error) {
+func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, interface{ CloseIdleConnections() }, error) {
+	if client, transport, ok, err := curlHTTPClient(p); ok || err != nil {
+		return client, transport, err
+	}
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ForceAttemptHTTP2 = true
 	tr.DisableCompression = false

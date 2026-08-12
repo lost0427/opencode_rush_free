@@ -25,7 +25,7 @@ const (
 
 type cachedClient struct {
 	client    *http.Client
-	transport *http.Transport
+	transport interface{ CloseIdleConnections() }
 	lastUsed  atomic.Int64
 	dynamic   bool
 }

@@ -6,15 +6,16 @@ COPY web/ ./
 RUN npm run build
 
 FROM golang:1.26.5-alpine AS backend
+RUN apk add --no-cache curl-dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . ./
 COPY --from=frontend /src/web/dist ./web/dist
-RUN CGO_ENABLED=0 go build -o /out/opencode-proxy ./cmd/server
+RUN CGO_ENABLED=1 go build -o /out/opencode-proxy ./cmd/server
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates libcurl
 WORKDIR /app
 COPY --from=backend /out/opencode-proxy ./opencode-proxy
 COPY --from=backend /src/web/dist ./web/dist
