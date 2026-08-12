@@ -77,6 +77,31 @@ func TestModelAliasRespectsEnabledPolicy(t *testing.T) {
 	}
 }
 
+func TestAliasCanShadowPaidUpstreamModel(t *testing.T) {
+	a := testApp(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	insert := func(id string, free int) {
+		if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,pricing_metadata,raw_metadata,refreshed_at) VALUES(?,?,?,?,?,?,?)", id, id, free, "test", "{}", "{}", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("paid:flash", 0)
+	insert("paid:flash-free", 1)
+	create := httptest.NewRecorder()
+	a.createModelAlias(create, httptest.NewRequest(http.MethodPost, "/api/model-aliases", strings.NewReader(`{"alias":"paid:flash","target_model_id":"paid:flash-free"}`)))
+	if create.Code != http.StatusCreated {
+		t.Fatalf("alias shadowing a paid model should be allowed: %d %s", create.Code, create.Body.String())
+	}
+	if resolved, err := a.resolveModel("paid:flash"); err != nil || resolved != "paid:flash-free" {
+		t.Fatalf("paid-model alias did not resolve to free target: %q %v", resolved, err)
+	}
+	conflict := httptest.NewRecorder()
+	a.createModelAlias(conflict, httptest.NewRequest(http.MethodPost, "/api/model-aliases", strings.NewReader(`{"alias":"paid:flash-free","target_model_id":"paid:flash"}`)))
+	if conflict.Code != http.StatusBadRequest {
+		t.Fatalf("alias shadowing a free model should still be rejected: %d %s", conflict.Code, conflict.Body.String())
+	}
+}
+
 func TestModelRefreshPreservesPoliciesAndHidesStaleAliases(t *testing.T) {
 	a := testApp(t)
 	requestCount := 0

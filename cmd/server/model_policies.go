@@ -131,11 +131,11 @@ func (a *App) validateAliasTarget(alias, target string) error {
 		return errors.New("alias cannot target itself")
 	}
 	var count int
-	if err := a.db.QueryRow("SELECT COUNT(*) FROM models WHERE model_id=?", alias).Scan(&count); err != nil {
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM models WHERE model_id=? AND is_free=1", alias).Scan(&count); err != nil {
 		return err
 	}
 	if count > 0 {
-		return errors.New("alias conflicts with an upstream model id")
+		return errors.New("alias conflicts with an enabled free model id")
 	}
 	if err := a.db.QueryRow("SELECT COUNT(*) FROM models WHERE model_id=? AND is_free=1", target).Scan(&count); err != nil {
 		return err
