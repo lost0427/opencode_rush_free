@@ -707,15 +707,16 @@ func TestUsageRatesUseRollingSixtySecondWindow(t *testing.T) {
 
 func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	a := testApp(t)
-	var modelHeaders, chatHeaders http.Header
+	modelHeadersCh := make(chan http.Header, 1)
+	chatHeadersCh := make(chan http.Header, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
-			modelHeaders = r.Header.Clone()
+			modelHeadersCh <- r.Header.Clone()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":[{"id":"alpha:free"}]}`))
 		case "/v1/chat/completions":
-			chatHeaders = r.Header.Clone()
+			chatHeadersCh <- r.Header.Clone()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`))
 		default:
@@ -747,6 +748,7 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	if refresh.Code != http.StatusOK {
 		t.Fatalf("model refresh failed: %d body=%s", refresh.Code, refresh.Body.String())
 	}
+	modelHeaders := <-modelHeadersCh
 	if modelHeaders.Get("User-Agent") != "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13" || modelHeaders.Get("X-Opencode-Client") != "cli" || modelHeaders.Get("X-Relay-Test") != "enabled" {
 		t.Fatalf("custom model headers were not forwarded: %#v", modelHeaders)
 	}
@@ -767,6 +769,7 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	chatHeaders := <-chatHeadersCh
 	if chatHeaders.Get("User-Agent") != "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13" || chatHeaders.Get("X-Opencode-Client") != "cli" || chatHeaders.Get("X-Relay-Test") != "enabled" {
 		t.Fatalf("custom chat headers were not forwarded: %#v", chatHeaders)
 	}
@@ -1817,9 +1820,9 @@ func TestUsageRecordsRouteEngine(t *testing.T) {
 
 func TestResinHTTPProxyUsesDynamicBasicCredentials(t *testing.T) {
 	a := testApp(t)
-	var authorization string
+	authorizationCh := make(chan string, 1)
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authorization = r.Header.Get("Proxy-Authorization")
+		authorizationCh <- r.Header.Get("Proxy-Authorization")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer proxyServer.Close()
@@ -1837,7 +1840,7 @@ func TestResinHTTPProxyUsesDynamicBasicCredentials(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("Default.account-hash:proxy-token"))
-	if authorization != want {
+	if authorization := <-authorizationCh; authorization != want {
 		t.Fatalf("unexpected Resin proxy authorization: got=%q want=%q", authorization, want)
 	}
 }
