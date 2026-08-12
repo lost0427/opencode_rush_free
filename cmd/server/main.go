@@ -1425,6 +1425,14 @@ func (a *App) refreshModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func applyUpstreamHeaders(req *http.Request, cfg upstreamConfig) {
+	// Match opencode's Fetch client defaults while keeping caller-supplied
+	// provider headers authoritative.
+	for name, value := range defaultUpstreamHeaders {
+		if req.Header.Get(name) == "" {
+			req.Header.Set(name, value)
+		}
+	}
+	req.Header.Set("Accept", "application/json")
 	applyCustomHeaders(req, cfg.CustomHeaders)
 	if cfg.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
@@ -2260,6 +2268,9 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 
 func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, *http.Transport, error) {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ForceAttemptHTTP2 = true
+	tr.DisableCompression = false
+	tr.MaxConnsPerHost = 64
 	tr.MaxIdleConns = 256
 	tr.MaxIdleConnsPerHost = 32
 	tr.IdleConnTimeout = 90 * time.Second
