@@ -57,9 +57,15 @@ func (t *curlTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	x := C.CString(extra.String())
 	defer C.free(unsafe.Pointer(x))
-	e := C.run(u, m, b, p, a, x, 120000, &out, &st)
-	if e != C.CURLE_OK {
-		return nil, fmt.Errorf("curl: %s", C.GoString(C.curl_easy_strerror(e)))
+	result := make(chan C.CURLcode, 1)
+	go func() { result <- C.run(u, m, b, p, a, x, 120000, &out, &st) }()
+	select {
+	case e := <-result:
+		if e != C.CURLE_OK {
+			return nil, fmt.Errorf("curl: %s", C.GoString(C.curl_easy_strerror(e)))
+		}
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
 	}
 	data := C.GoBytes(unsafe.Pointer(out.p), C.int(out.n))
 	C.free(unsafe.Pointer(out.p))
