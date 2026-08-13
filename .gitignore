@@ -3,6 +3,8 @@
 *.db-*
 opencode-proxy-linux
 opencode-proxy-linux-amd64
+bun-bridge.exe
+NUL
 web/node_modules/
 web/dist/
 web/tsconfig.tsbuildinfo

@@ -25,6 +25,7 @@ import (
 
 func testApp(t testing.TB) *App {
 	t.Helper()
+	testBunBridge(t)
 	db, err := sql.Open("sqlite", "file:test-"+strings.ReplaceAll(t.Name(), "/", "-")+"?mode=memory&cache=shared")
 	if err != nil {
 		t.Fatal(err)
@@ -830,9 +831,8 @@ func TestVisionUseProxySettingAndDirectTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, ok := client.Transport.(*http.Transport)
-	if !ok || transport.Proxy != nil {
-		t.Fatal("empty proxy record did not configure a direct transport")
+	if _, ok := client.Transport.(*bunTransport); !ok {
+		t.Fatal("empty proxy record did not configure the Bun transport")
 	}
 }
 

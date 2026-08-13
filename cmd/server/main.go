@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/net/proxy"
 	moderncsqlite "modernc.org/sqlite"
 )
 
@@ -1480,7 +1479,7 @@ func (a *App) testUpstreamRequest(ctx context.Context, cfg upstreamConfig, body 
 		} else {
 			applyUpstreamHeaders(req, cfg)
 			req.Header.Set("Content-Type", "application/json")
-			resp, err = (&http.Client{Timeout: 90 * time.Second}).Do(req)
+			resp, err = newBunTransport(ProxyRecord{}).RoundTrip(req)
 		}
 	} else {
 		req, _ := http.NewRequestWithContext(ctx, "POST", "http://relaydesk.invalid", nil)
@@ -2267,49 +2266,8 @@ func (a *App) httpClient(p ProxyRecord) (*http.Client, error) {
 }
 
 func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, interface{ CloseIdleConnections() }, error) {
-	if client, transport, ok, err := curlHTTPClient(p); ok || err != nil {
-		return client, transport, err
-	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ForceAttemptHTTP2 = true
-	tr.DisableCompression = false
-	tr.MaxConnsPerHost = 64
-	tr.MaxIdleConns = 256
-	tr.MaxIdleConnsPerHost = 32
-	tr.IdleConnTimeout = 90 * time.Second
-	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	tr.ResponseHeaderTimeout = upstreamRequestTimeout
-	if strings.TrimSpace(p.URI) == "" {
-		tr.Proxy = nil
-		return &http.Client{Transport: tr}, tr, nil
-	}
-	u, err := url.Parse(p.URI)
-	if err != nil {
-		return nil, nil, err
-	}
-	if u.Scheme == "socks5" || u.Scheme == "socks5h" {
-		var auth *proxy.Auth
-		if p.Username != "" {
-			auth = &proxy.Auth{User: p.Username, Password: p.Password}
-		}
-		d, err := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
-		if err != nil {
-			return nil, nil, err
-		}
-		tr.Proxy = nil
-		tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-			if contextDialer, ok := d.(proxy.ContextDialer); ok {
-				return contextDialer.DialContext(ctx, network, address)
-			}
-			return d.Dial(network, address)
-		}
-	} else {
-		if p.Username != "" {
-			u.User = url.UserPassword(p.Username, p.Password)
-		}
-		tr.Proxy = http.ProxyURL(u)
-	}
-	return &http.Client{Transport: tr}, tr, nil
+	transport := newBunTransport(p)
+	return &http.Client{Transport: transport}, transport, nil
 }
 func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time) (*tokenUsage, string, *time.Duration, error) {
 	defer resp.Body.Close()
