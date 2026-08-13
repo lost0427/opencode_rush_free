@@ -14,6 +14,12 @@ import (
 	"time"
 )
 
+func TestRetryableUpstreamStatusIncludesUnauthorized(t *testing.T) {
+	if !retryableUpstreamStatus(http.StatusUnauthorized) {
+		t.Fatal("401 must rotate to another proxy before returning the upstream response")
+	}
+}
+
 func TestLegacyClientKeyMigrationAndLimits(t *testing.T) {
 	a := testApp(t)
 	legacy := "legacy-client-key"

@@ -2008,7 +2008,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				_ = resp.Body.Close()
 				continue
 			}
-		} else if resp.StatusCode == http.StatusTooManyRequests {
+		} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
 			a.clearSessionProxy(requestSessionKey, p.ID)
 		}
 		if retryableUpstreamStatus(resp.StatusCode) && i+1 < attempts && !resinMode {
