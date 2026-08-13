@@ -19,7 +19,7 @@ COPY bun-bridge/server.ts ./server.ts
 RUN bun build --compile --outfile /out/bun-bridge ./server.ts
 
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates libgcc libstdc++
 WORKDIR /app
 COPY --from=backend /out/opencode-proxy ./opencode-proxy
 COPY --from=backend /src/web/dist ./web/dist
