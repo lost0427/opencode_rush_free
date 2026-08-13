@@ -1968,6 +1968,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if resinMode {
+				if advanceErr := resinRoute.advance(a); advanceErr != nil {
+					log.Printf("advance Resin account failed: %v", advanceErr)
+				}
+				if i+1 < attempts {
+					continue
+				}
 				a.resinFailure(e)
 				break
 			}
@@ -1992,7 +1998,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			lastErr = errors.New("proxy authentication failed")
 			continue
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && resinMode {
+		if resinMode && (resp.StatusCode == http.StatusTooManyRequests || retryableUpstreamStatus(resp.StatusCode)) {
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}

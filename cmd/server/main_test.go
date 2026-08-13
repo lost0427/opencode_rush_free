@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1883,4 +1884,83 @@ func TestRecoverResinClearsPersistedFallback(t *testing.T) {
 	if err != nil || status.ResinFallbackActive || status.EffectiveEngine != proxyEngineResin {
 		t.Fatalf("Resin did not recover: %#v err=%v", status, err)
 	}
+}
+
+func TestResinRotatesOn502AndTimeout(t *testing.T) {
+	a := testApp(t)
+	rec := httptest.NewRecorder()
+	a.putUpstream(rec, httptest.NewRequest(http.MethodPut, "/api/settings/upstream", strings.NewReader(`{"base_url":"http://upstream.example.test"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("configure upstream failed: %d %s", rec.Code, rec.Body.String())
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := a.db.Exec("INSERT INTO models(model_id,display_name,is_free,free_reason,refreshed_at) VALUES(?,?,?,?,?)", "resin-retry:free", "Retry", 1, "test", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec("UPDATE settings SET value=? WHERE key='client_key'", hashToken("resin-retry-client")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.migrateLegacyClientKey(); err != nil {
+		t.Fatal(err)
+	}
+	setEngine := func(gatewayURL string) {
+		rec := httptest.NewRecorder()
+		a.putProxyEngine(rec, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(`{"engine":"resin","resin_gateway_url":"`+gatewayURL+`","resin_platform":"Default","resin_proxy_token":"proxy-token"}`)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("configure Resin failed: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	chat := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"resin-retry:free","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer resin-retry-client")
+		w := httptest.NewRecorder()
+		a.gatewayChat(w, req)
+		return w
+	}
+	lastRetryCount := func() int {
+		var n int
+		if err := a.db.QueryRow("SELECT retry_count FROM usage_requests WHERE request_kind='chat' ORDER BY id DESC LIMIT 1").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("upstream 502 rotates account", func(t *testing.T) {
+		var hits atomic.Int32
+		gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		defer gateway.Close()
+		setEngine(gateway.URL)
+		if w := chat(); w.Code != http.StatusBadGateway {
+			t.Fatalf("final status = %d, want 502", w.Code)
+		}
+		// Old behavior (no rotation on 502) hits the gateway once; each rotate
+		// attempt hits it again, so the hit count proves account rotation.
+		if got := hits.Load(); got != resinMaxAttempts {
+			t.Fatalf("resin gateway hits = %d, want %d", got, resinMaxAttempts)
+		}
+		if got := lastRetryCount(); got != resinMaxAttempts-1 {
+			t.Fatalf("retry_count = %d, want %d", got, resinMaxAttempts-1)
+		}
+	})
+
+	t.Run("transport error rotates account", func(t *testing.T) {
+		gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		gateway.Close() // unreachable gateway -> bridge fetch fails -> transport error
+		setEngine(gateway.URL)
+		if w := chat(); w.Code != http.StatusBadGateway {
+			t.Fatalf("final status = %d, want 502", w.Code)
+		}
+		if got := lastRetryCount(); got != resinMaxAttempts-1 {
+			t.Fatalf("retry_count = %d, want %d", got, resinMaxAttempts-1)
+		}
+		a.resinMu.Lock()
+		failures := a.resinFailureCount
+		a.resinMu.Unlock()
+		if failures != 1 {
+			t.Fatalf("resinFailureCount = %d, want 1 (only recorded when giving up)", failures)
+		}
+	})
 }
