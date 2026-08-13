@@ -6,7 +6,7 @@ COPY web/ ./
 RUN npm run build
 
 FROM golang:1.26.5-alpine AS backend
-RUN apk add --no-cache curl-dev
+RUN apk add --no-cache build-base curl-dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
