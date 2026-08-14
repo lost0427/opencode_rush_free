@@ -765,7 +765,8 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	if cfg.VisionBaseURL != upstream.URL || cfg.VisionAPIKey != "vision-secret" || cfg.VisionModel != "vision-model" {
 		t.Fatalf("vision supplier configuration was not isolated: %#v", cfg)
 	}
-	resp, err := a.forward(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL})
+	chatRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp, err := a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_test", "ses_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -777,6 +778,9 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	}
 	if chatHeaders.Get("Authorization") != "Bearer up-secret" || chatHeaders.Get("Content-Type") != "application/json" {
 		t.Fatalf("gateway-managed headers were not injected: %#v", chatHeaders)
+	}
+	if chatHeaders.Get("X-Opencode-Project") != "global" || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Request"), "msg_") || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Session"), "ses_") {
+		t.Fatalf("OpenCode identity headers were not injected: %#v", chatHeaders)
 	}
 }
 

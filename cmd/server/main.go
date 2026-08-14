@@ -530,6 +530,15 @@ func randomKey() (string, error) {
 	// clients that reject underscores in API keys.
 	return "ocp-" + strings.ReplaceAll(base64.RawURLEncoding.EncodeToString(b), "_", "-"), nil
 }
+
+func openCodeID(prefix string) (string, error) {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s_%x%s", prefix, time.Now().UnixMilli(), base64.RawURLEncoding.EncodeToString(b)), nil
+}
+
 func hashToken(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return base64.RawURLEncoding.EncodeToString(h[:])
@@ -1483,7 +1492,7 @@ func (a *App) testUpstreamRequest(ctx context.Context, cfg upstreamConfig, body 
 		}
 	} else {
 		req, _ := http.NewRequestWithContext(ctx, "POST", "http://relaydesk.invalid", nil)
-		resp, err = a.forward(req, body, cfg, *p)
+		resp, err = a.forward(req, body, cfg, *p, "", "")
 	}
 	result := map[string]any{}
 	if p != nil {
@@ -1807,6 +1816,19 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	requestSessionKey := sessionKey(r, parsed.User)
+	requestID, err := openCodeID("msg")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize upstream request identity"})
+		return
+	}
+	upstreamSessionID := "ses_" + requestSessionKey
+	if requestSessionKey == "" {
+		upstreamSessionID, err = openCodeID("ses")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize upstream session identity"})
+			return
+		}
+	}
 	var resinRoute *resinRequestRoute
 	if resinMode {
 		resinRoute, err = newResinRequestRoute(requestSessionKey)
@@ -1879,7 +1901,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			visionCfg := upstreamConfig{BaseURL: cfg.VisionBaseURL, APIKey: cfg.VisionAPIKey}
 			helperCtx, helperCancel := visionRequestContext(r)
 			helperRequest := r.Clone(helperCtx)
-			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, helperProxy)
+			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, helperProxy, "", "")
 			if helpErr != nil {
 				helperCancel()
 				lastErr = fmt.Errorf("vision helper request failed: %w", helpErr)
@@ -1958,7 +1980,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
-		resp, e := a.forward(r, bodyToForward, cfg, p)
+		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID)
 		if e != nil {
 			lastErr = e
 			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
@@ -2065,12 +2087,17 @@ func lastErrString(e error) string {
 	}
 	return e.Error()
 }
-func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord) (*http.Response, error) {
+func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, requestID, sessionID string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	applyUpstreamHeaders(req, cfg)
+	if requestID != "" {
+		req.Header.Set("X-Opencode-Project", "global")
+		req.Header.Set("X-Opencode-Request", requestID)
+		req.Header.Set("X-Opencode-Session", sessionID)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	client, err := a.httpClient(p)
 	if err != nil {
