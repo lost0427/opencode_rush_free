@@ -117,6 +117,7 @@ type ProxyEngine = {
   effective_engine: "builtin" | "resin";
   resin_gateway_url: string;
   resin_platform: string;
+  resin_dynamic_scoring: boolean;
   has_resin_proxy_token: boolean;
   resin_configured: boolean;
   resin_fallback_active: boolean;
@@ -1046,6 +1047,7 @@ function Proxies({
     has_resin_proxy_token: false,
     resin_configured: false,
     resin_fallback_active: false,
+    resin_dynamic_scoring: false,
   });
   const [resinGatewayURL, setResinGatewayURL] = useState("");
   const [resinPlatform, setResinPlatform] = useState("Default");
@@ -1251,6 +1253,7 @@ function Proxies({
         engine: nextEngine,
         resin_gateway_url: resinGatewayURL,
         resin_platform: resinPlatform,
+        resin_dynamic_scoring: engineConfig.resin_dynamic_scoring,
       };
       if (resinTokenDirty) payload.resin_proxy_token = resinToken;
       const next = (await api("/api/settings/proxy-engine", {
@@ -1367,6 +1370,21 @@ function Proxies({
                   placeholder={engineConfig.has_resin_proxy_token ? "Stored securely" : "Optional when Resin auth is disabled"}
                   autoComplete="new-password"
                 />
+              </label>
+              <label className="resin-token-field">
+                <span>
+                  <input
+                    type="checkbox"
+                    checked={engineConfig.resin_dynamic_scoring}
+                    onChange={(event) =>
+                      setEngineConfig((current) => ({
+                        ...current,
+                        resin_dynamic_scoring: event.target.checked,
+                      }))
+                    }
+                  />{" "}
+                  动态账号评分
+                </span>
               </label>
             </div>
             <div className="config-actions">

@@ -47,6 +47,7 @@ type App struct {
 	resinLastSuccessPersist time.Time
 	resinProbeMu            sync.Mutex
 	resinLastAutoProbe      time.Time
+	resinScores             resinScoreStore
 	gatewaySem              chan struct{}
 	rr                      atomic.Uint64
 	proxyRuntime            *proxyRuntime
@@ -1984,6 +1985,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID)
 		if e != nil {
 			lastErr = e
+			if resinMode && engineConfig.DynamicScoring {
+				a.resinScores.observe(resinAccount(p.Username), 0, e)
+			}
 			attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, 0, e, ""))
 			if requestErr := r.Context().Err(); requestErr != nil {
 				downstreamErr = requestErr
@@ -2024,6 +2028,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resinMode && (resp.StatusCode == http.StatusTooManyRequests || retryableUpstreamStatus(resp.StatusCode)) {
+			if engineConfig.DynamicScoring {
+				a.resinScores.observe(resinAccount(p.Username), resp.StatusCode, nil)
+			}
 			if advanceErr := resinRoute.advance(a); advanceErr != nil {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}
@@ -2061,6 +2068,9 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if copyErr != nil {
 			requestError = errors.Join(requestError, copyErr)
+		}
+		if resinMode && engineConfig.DynamicScoring {
+			a.resinScores.observe(resinAccount(p.Username), resp.StatusCode, copyErr)
 		}
 		attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, resp.StatusCode, copyErr, upstreamError))
 		a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, clientUserAgent, parsed.Stream, requestError)

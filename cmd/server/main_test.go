@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1678,7 +1679,7 @@ func TestUsageRetentionSettingsDeleteExpiredRecords(t *testing.T) {
 
 func TestResinProxyEngineStoresTokenAndDerivesSessionAccounts(t *testing.T) {
 	a := testApp(t)
-	payload := `{"engine":"resin","resin_gateway_url":"http://resin.example.test:2260","resin_platform":"Default","resin_proxy_token":"proxy-secret"}`
+	payload := `{"engine":"resin","resin_gateway_url":"http://resin.example.test:2260","resin_platform":"Default","resin_proxy_token":"proxy-secret","resin_dynamic_scoring":true}`
 	recorder := httptest.NewRecorder()
 	a.putProxyEngine(recorder, httptest.NewRequest(http.MethodPut, "/api/settings/proxy-engine", strings.NewReader(payload)))
 	if recorder.Code != http.StatusOK {
@@ -1688,7 +1689,7 @@ func TestResinProxyEngineStoresTokenAndDerivesSessionAccounts(t *testing.T) {
 		t.Fatalf("Resin proxy token leaked in API response: %s", recorder.Body.String())
 	}
 	cfg, err := a.loadProxyEngine()
-	if err != nil || cfg.Engine != proxyEngineResin || cfg.ResinProxyToken != "proxy-secret" {
+	if err != nil || cfg.Engine != proxyEngineResin || cfg.ResinProxyToken != "proxy-secret" || !cfg.DynamicScoring {
 		t.Fatalf("stored Resin configuration is invalid: %#v err=%v", cfg, err)
 	}
 	first, err := a.resinProxyForSession("session-one")
@@ -1752,6 +1753,42 @@ func TestEphemeralResinRequestRouteRotatesWithoutPersistingSession(t *testing.T)
 	}
 	if persisted != 0 {
 		t.Fatalf("ephemeral Resin routing persisted %d session rows", persisted)
+	}
+}
+
+func TestResinDynamicScoringPrefersSuccessWithoutBlockingFreshAccounts(t *testing.T) {
+	var concurrentScores resinScoreStore
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				concurrentScores.observe("concurrent", http.StatusOK, nil)
+				_ = concurrentScores.pick(fmt.Sprintf("concurrent-fresh-%d", j), nil)
+			}
+		}()
+	}
+	wg.Wait()
+	var scores resinScoreStore
+	scores.observe("good", http.StatusOK, nil)
+	scores.observe("good", http.StatusOK, nil)
+	scores.observe("limited", http.StatusTooManyRequests, nil)
+	used := map[string]struct{}{}
+	good, fresh := 0, 0
+	for i := 0; i < 100; i++ {
+		account := scores.pick(fmt.Sprintf("fresh-%d", i), used)
+		if account == "limited" {
+			t.Fatal("rate-limited account was preferred")
+		}
+		if account == "good" {
+			good++
+		} else {
+			fresh++
+		}
+	}
+	if good <= fresh || fresh == 0 {
+		t.Fatalf("dynamic scoring distribution is invalid: good=%d fresh=%d", good, fresh)
 	}
 }
 

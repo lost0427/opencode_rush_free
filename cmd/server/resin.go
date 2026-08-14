@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +22,7 @@ const (
 	resinGatewayURLSettingKey   = "resin_gateway_url"
 	resinProxyTokenSettingKey   = "resin_proxy_token"
 	resinPlatformSettingKey     = "resin_platform"
+	resinDynamicScoringKey      = "resin_dynamic_scoring"
 	resinFallbackActiveSetting  = "resin_fallback_active"
 	resinFallbackSinceSetting   = "resin_fallback_since"
 	resinFallbackReasonSetting  = "resin_fallback_reason"
@@ -37,6 +39,7 @@ type proxyEngineConfig struct {
 	ResinGatewayURL string
 	ResinProxyToken string
 	ResinPlatform   string
+	DynamicScoring  bool
 	FallbackActive  bool
 	FallbackSince   *time.Time
 	FallbackReason  string
@@ -49,6 +52,7 @@ type proxyEngineStatus struct {
 	EffectiveEngine     string     `json:"effective_engine"`
 	ResinGatewayURL     string     `json:"resin_gateway_url"`
 	ResinPlatform       string     `json:"resin_platform"`
+	DynamicScoring      bool       `json:"resin_dynamic_scoring"`
 	HasResinProxyToken  bool       `json:"has_resin_proxy_token"`
 	ResinConfigured     bool       `json:"resin_configured"`
 	ResinFallbackActive bool       `json:"resin_fallback_active"`
@@ -121,6 +125,11 @@ func (a *App) loadProxyEngineFromDB() (proxyEngineConfig, error) {
 	}
 	if cfg.ResinPlatform == "" {
 		cfg.ResinPlatform = "Default"
+	}
+	if raw, readErr := settingValue(a.db, resinDynamicScoringKey); readErr != nil {
+		return cfg, readErr
+	} else {
+		cfg.DynamicScoring, _ = strconv.ParseBool(raw)
 	}
 	var encryptedToken string
 	if encryptedToken, err = settingValue(a.db, resinProxyTokenSettingKey); err != nil {
@@ -204,6 +213,7 @@ func (a *App) proxyEngineStatus() (proxyEngineStatus, error) {
 		EffectiveEngine:     cfg.Engine,
 		ResinGatewayURL:     cfg.ResinGatewayURL,
 		ResinPlatform:       cfg.ResinPlatform,
+		DynamicScoring:      cfg.DynamicScoring,
 		HasResinProxyToken:  cfg.ResinProxyToken != "",
 		ResinConfigured:     configured,
 		ResinFallbackActive: cfg.FallbackActive,
@@ -230,6 +240,7 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 		ResinGatewayURL *string `json:"resin_gateway_url"`
 		ResinPlatform   *string `json:"resin_platform"`
 		ResinProxyToken *string `json:"resin_proxy_token"`
+		DynamicScoring  *bool   `json:"resin_dynamic_scoring"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid proxy engine configuration"})
@@ -270,6 +281,10 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 	if in.ResinProxyToken != nil {
 		token = strings.TrimSpace(*in.ResinProxyToken)
 	}
+	dynamicScoring := old.DynamicScoring
+	if in.DynamicScoring != nil {
+		dynamicScoring = *in.DynamicScoring
+	}
 	encryptedToken, err := a.encrypt(token)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not encrypt Resin proxy token"})
@@ -286,6 +301,7 @@ func (a *App) putProxyEngine(w http.ResponseWriter, r *http.Request) {
 		{resinGatewayURLSettingKey, gatewayURL},
 		{resinPlatformSettingKey, platform},
 		{resinProxyTokenSettingKey, encryptedToken},
+		{resinDynamicScoringKey, strconv.FormatBool(dynamicScoring)},
 	}
 	if engine == proxyEngineBuiltin {
 		values = append(values,
@@ -355,6 +371,7 @@ type resinRequestRoute struct {
 	sessionKey          string
 	ephemeralSeed       string
 	ephemeralGeneration uint64
+	used                map[string]struct{}
 }
 
 func newResinRequestRoute(sessionKey string) (*resinRequestRoute, error) {
@@ -374,15 +391,124 @@ func (route *resinRequestRoute) proxy(a *App, cfg proxyEngineConfig) (ProxyRecor
 	if route == nil {
 		return ProxyRecord{}, errors.New("Resin request route is not initialized")
 	}
+	var account string
 	if route.sessionKey != "" {
-		account, err := a.nextResinAccount(route.sessionKey)
+		var err error
+		account, err = a.nextResinAccount(route.sessionKey)
 		if err != nil {
 			return ProxyRecord{}, err
 		}
-		return a.resinProxy(cfg, account)
+	} else {
+		account = hashToken(route.ephemeralSeed + "\x00" + strconv.FormatUint(route.ephemeralGeneration, 10))
 	}
-	account := hashToken(route.ephemeralSeed + "\x00" + strconv.FormatUint(route.ephemeralGeneration, 10))
+	if cfg.DynamicScoring {
+		if route.used == nil {
+			route.used = make(map[string]struct{}, resinMaxAttempts)
+		}
+		account = a.resinScores.pick(account, route.used)
+		route.used[account] = struct{}{}
+	}
 	return a.resinProxy(cfg, account)
+}
+
+type resinScore struct {
+	value   int
+	updated time.Time
+}
+
+type resinScoreStore struct {
+	mu      sync.Mutex
+	entries map[string]resinScore
+	cursor  uint64
+}
+
+func (s *resinScoreStore) pick(fresh string, used map[string]struct{}) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	total := 4 // Keep exploring new Resin accounts even when known accounts are healthy.
+	for account, entry := range s.entries {
+		entry = decayResinScore(entry, now)
+		s.entries[account] = entry
+		if _, seen := used[account]; seen || entry.value <= 0 {
+			continue
+		}
+		total += entry.value
+	}
+	s.cursor++
+	choice := int(s.cursor % uint64(total))
+	if choice < 4 {
+		return fresh
+	}
+	choice -= 4
+	for account, entry := range s.entries {
+		if _, seen := used[account]; seen || entry.value <= 0 {
+			continue
+		}
+		if choice < entry.value {
+			return account
+		}
+		choice -= entry.value
+	}
+	return fresh
+}
+
+func (s *resinScoreStore) observe(account string, status int, err error) {
+	if account == "" || errors.Is(err, context.Canceled) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.entries == nil {
+		s.entries = make(map[string]resinScore)
+	}
+	now := time.Now()
+	entry := decayResinScore(s.entries[account], now)
+	switch {
+	case err != nil && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout")):
+		entry.value -= 6
+	case err != nil:
+		entry.value -= 4
+	case status == http.StatusUnauthorized || status == http.StatusTooManyRequests:
+		entry.value -= 10
+	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
+		entry.value -= 6
+	case status >= 500:
+		entry.value -= 5
+	case status >= 200 && status < 300:
+		entry.value += 3
+	}
+	entry.value = max(-20, min(20, entry.value))
+	entry.updated = now
+	s.entries[account] = entry
+	if len(s.entries) > 256 {
+		oldestAccount, oldest := "", now
+		for candidate, candidateEntry := range s.entries {
+			if candidateEntry.updated.Before(oldest) {
+				oldestAccount, oldest = candidate, candidateEntry.updated
+			}
+		}
+		delete(s.entries, oldestAccount)
+	}
+}
+
+func decayResinScore(entry resinScore, now time.Time) resinScore {
+	steps := int(now.Sub(entry.updated) / (5 * time.Minute))
+	if entry.updated.IsZero() || steps <= 0 {
+		return entry
+	}
+	if entry.value > 0 {
+		entry.value = max(0, entry.value-steps)
+	} else {
+		entry.value = min(0, entry.value+steps)
+	}
+	entry.updated = entry.updated.Add(time.Duration(steps) * 5 * time.Minute)
+	return entry
+}
+
+func resinAccount(username string) string {
+	_, account, _ := strings.Cut(username, ".")
+	return account
 }
 
 func (route *resinRequestRoute) advance(a *App) error {
