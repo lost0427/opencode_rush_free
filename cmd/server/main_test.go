@@ -1928,12 +1928,25 @@ func TestResinRotatesOn502AndTimeout(t *testing.T) {
 		}
 		return n
 	}
+	lastAttempts := func() []map[string]any {
+		var raw string
+		if err := a.db.QueryRow("SELECT attempt_summary FROM usage_requests WHERE request_kind='chat' ORDER BY id DESC LIMIT 1").Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var attempts []map[string]any
+		if err := json.Unmarshal([]byte(raw), &attempts); err != nil {
+			t.Fatal(err)
+		}
+		return attempts
+	}
 
 	t.Run("upstream 502 rotates account", func(t *testing.T) {
 		var hits atomic.Int32
 		gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			hits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"message":"temporary upstream failure"}}`)
 		}))
 		defer gateway.Close()
 		setEngine(gateway.URL)
@@ -1947,6 +1960,15 @@ func TestResinRotatesOn502AndTimeout(t *testing.T) {
 		}
 		if got := lastRetryCount(); got != resinMaxAttempts-1 {
 			t.Fatalf("retry_count = %d, want %d", got, resinMaxAttempts-1)
+		}
+		attempts := lastAttempts()
+		if len(attempts) != resinMaxAttempts {
+			t.Fatalf("attempt summary count = %d, want %d", len(attempts), resinMaxAttempts)
+		}
+		for i, attempt := range attempts {
+			if attempt["attempt"] != float64(i+1) || attempt["reason"] != "upstream_error" || attempt["message"] != "temporary upstream failure" || attempt["account"] == "" || attempt["duration_ms"] == nil {
+				t.Fatalf("attempt %d was not fully recorded: %#v", i+1, attempt)
+			}
 		}
 	})
 
@@ -1965,6 +1987,15 @@ func TestResinRotatesOn502AndTimeout(t *testing.T) {
 		a.resinMu.Unlock()
 		if failures != 1 {
 			t.Fatalf("resinFailureCount = %d, want 1 (only recorded when giving up)", failures)
+		}
+		attempts := lastAttempts()
+		if len(attempts) != resinMaxAttempts {
+			t.Fatalf("transport attempt summary count = %d, want %d", len(attempts), resinMaxAttempts)
+		}
+		for i, attempt := range attempts {
+			if attempt["reason"] != "transport_error" || attempt["message"] == "" || attempt["account"] == "" {
+				t.Fatalf("transport attempt %d was not classified: %#v", i+1, attempt)
+			}
 		}
 	})
 }

@@ -1980,10 +1980,11 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
+		attemptStarted := time.Now()
 		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID)
 		if e != nil {
 			lastErr = e
-			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "error": truncateError(e.Error()), "latency_ms": time.Since(start).Milliseconds()})
+			attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, 0, e, ""))
 			if requestErr := r.Context().Err(); requestErr != nil {
 				downstreamErr = requestErr
 				lastErr = requestErr
@@ -2014,9 +2015,11 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			a.markProxySuccess(p.ID)
 		}
 		if resp.StatusCode == http.StatusProxyAuthRequired && !resinMode {
-			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "error": "proxy authentication failed", "latency_ms": time.Since(start).Milliseconds()})
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			_ = resp.Body.Close()
+			message := readRetryResponse(resp)
+			if message == "" {
+				message = "proxy authentication failed"
+			}
+			attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, resp.StatusCode, nil, message))
 			lastErr = errors.New("proxy authentication failed")
 			continue
 		}
@@ -2025,18 +2028,16 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 				log.Printf("advance Resin account failed: %v", advanceErr)
 			}
 			if i+1 < attempts {
-				attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
-				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-				_ = resp.Body.Close()
+				message := readRetryResponse(resp)
+				attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, resp.StatusCode, nil, message))
 				continue
 			}
 		} else if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
 			a.clearSessionProxy(requestSessionKey, p.ID)
 		}
 		if retryableUpstreamStatus(resp.StatusCode) && i+1 < attempts && !resinMode {
-			attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			_ = resp.Body.Close()
+			message := readRetryResponse(resp)
+			attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, resp.StatusCode, nil, message))
 			if !waitForRetry(r.Context(), retryAfterDelay(resp, i)) {
 				downstreamErr = r.Context().Err()
 				lastErr = downstreamErr
@@ -2061,13 +2062,84 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		if copyErr != nil {
 			requestError = errors.Join(requestError, copyErr)
 		}
-		attemptSummary = append(attemptSummary, map[string]any{"engine": routeEngine, "proxy": p.URI, "status_code": resp.StatusCode, "latency_ms": time.Since(start).Milliseconds()})
+		attemptSummary = append(attemptSummary, gatewayAttempt(i, routeEngine, p, attemptStarted, resp.StatusCode, copyErr, upstreamError))
 		a.recordGatewayUsageWithStream(clientKey, requestedModel, resolvedModel, proxyID, p.URI, routeEngine, status, resp.StatusCode, time.Since(start), firstTokenLatency, i, tokens, attemptSummary, clientUserAgent, parsed.Stream, requestError)
 		return
 	}
 	lastErr, finalStatus, origin := terminalGatewayFailure(downstreamErr, lastErr)
 	a.recordGatewayUsageWithOriginAndStream(clientKey, requestedModel, resolvedModel, nil, lastProxyURI, routeEngine, "error", finalStatus, time.Since(start), nil, retryCount, nil, attemptSummary, clientUserAgent, parsed.Stream, lastErr, origin)
 	writeJSON(w, finalStatus, map[string]string{"error": "all proxies failed", "detail": lastErrString(lastErr)})
+}
+
+func gatewayAttempt(index int, engine string, proxy ProxyRecord, started time.Time, status int, err error, message string) map[string]any {
+	attempt := map[string]any{
+		"attempt":     index + 1,
+		"engine":      engine,
+		"proxy":       proxy.URI,
+		"duration_ms": time.Since(started).Milliseconds(),
+		"reason":      gatewayAttemptReason(status, err),
+	}
+	if status != 0 {
+		attempt["status_code"] = status
+	}
+	if account := resinAccountHint(proxy.Username); account != "" {
+		attempt["account"] = account
+	}
+	if message = truncateError(message); message != "" {
+		attempt["message"] = message
+	} else if err != nil {
+		attempt["message"] = truncateError(err.Error())
+	}
+	return attempt
+}
+
+func gatewayAttemptReason(status int, err error) string {
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return "client_cancelled"
+		}
+		lower := strings.ToLower(err.Error())
+		if errors.Is(err, context.DeadlineExceeded) || strings.Contains(lower, "timeout awaiting response headers") {
+			return "header_timeout"
+		}
+		return "transport_error"
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusTooManyRequests:
+		return "rate_limit"
+	case 0:
+		return "transport_error"
+	default:
+		if status >= 400 {
+			return "upstream_error"
+		}
+		return "success"
+	}
+}
+
+func resinAccountHint(username string) string {
+	_, account, found := strings.Cut(username, ".")
+	if !found || account == "" {
+		return ""
+	}
+	if len(account) > 8 {
+		account = account[:8]
+	}
+	return account + "****"
+}
+
+func readRetryResponse(resp *http.Response) string {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	if summary := upstreamErrorSummary(body); summary != "" {
+		return summary
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func terminalGatewayFailure(requestErr, routeErr error) (error, int, string) {
