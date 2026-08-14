@@ -1,5 +1,5 @@
 import { createRoot } from "react-dom/client";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowUpRight,
@@ -102,6 +102,15 @@ type RequestRow = {
   total_tokens?: number;
   error_message?: string;
   route_engine?: "builtin" | "resin" | "direct";
+  attempt_summary?: RequestAttempt[];
+};
+type RequestAttempt = {
+  attempt: number;
+  account?: string;
+  status_code?: number;
+  duration_ms: number;
+  reason: string;
+  message?: string;
 };
 type ProxyEngine = {
   engine: "builtin" | "resin";
@@ -2373,6 +2382,16 @@ const formatDuration = (milliseconds?: number) => {
   }).format(milliseconds / 1000)} s`;
 };
 
+const attemptReasonLabel = (reason: string) => ({
+  success: "成功",
+  rate_limit: "上游限流",
+  unauthorized: "鉴权失败",
+  upstream_error: "上游错误",
+  header_timeout: "响应头超时",
+  transport_error: "连接错误",
+  client_cancelled: "客户端取消",
+}[reason] || reason);
+
 function Usage({
   notify,
   onLogout,
@@ -2398,6 +2417,7 @@ function Usage({
     measured_at: "",
   });
   const [dailyUsage, setDailyUsage] = useState<DailyUsage[]>([]);
+  const [expandedRequestId, setExpandedRequestId] = useState<number | null>(null);
 
   const requestPath = useMemo(() => {
     const params = new URLSearchParams({
@@ -2717,13 +2737,30 @@ function Usage({
               <span>总耗时</span>
               <span>路径</span>
             </div>
-            {rows.map((r) => (
-              <div className="table-row" key={r.id}>
+            {rows.map((r) => {
+              const attempts = r.attempt_summary || [];
+              const canExpand = attempts.length > 0 && (r.retry_count > 0 || r.status !== "success");
+              const expanded = canExpand && expandedRequestId === r.id;
+              return (
+              <Fragment key={r.id}>
+              <div className={`table-row ${expanded ? "is-expanded" : ""}`}>
                 <div>
                   <div className="request-model-line">
                     <b title={r.model}>{r.model}</b>
                     {r.request_kind === "vision_helper" && (
                       <span className="helper-tag">图片辅助</span>
+                    )}
+                    {canExpand && (
+                      <button
+                        className="attempt-toggle"
+                        type="button"
+                        title={expanded ? "收起重试明细" : "查看重试明细"}
+                        aria-expanded={expanded}
+                        onClick={() => setExpandedRequestId(expanded ? null : r.id)}
+                      >
+                        <ChevronRight size={13} />
+                        <span>{attempts.length} 次</span>
+                      </button>
                     )}
                   </div>
                   <small>{new Date(r.created_at).toLocaleString()}</small>
@@ -2777,7 +2814,35 @@ function Usage({
                   {(r.route_engine || (r.proxy_uri ? "builtin" : "direct")) + " · " + (r.proxy_uri || "direct")}
                 </span>
               </div>
-            ))}
+              {expanded && (
+                <div className="attempt-detail">
+                  <div className="attempt-detail-head">
+                    <b>请求尝试</b>
+                    <span>{attempts.length} 次 · 总耗时 {formatDuration(r.latency_ms)}</span>
+                  </div>
+                  <div className="attempt-list">
+                    {attempts.map((attempt) => (
+                      <div className="attempt-row" key={attempt.attempt}>
+                        <span className="attempt-index">#{attempt.attempt}</span>
+                        <span className="attempt-account">{attempt.account || "—"}</span>
+                        <span className={`attempt-reason reason-${attempt.reason}`}>
+                          {attemptReasonLabel(attempt.reason)}
+                        </span>
+                        <span className="attempt-status">
+                          {attempt.status_code ? `HTTP ${attempt.status_code}` : "无响应"}
+                        </span>
+                        <span className="attempt-time">{formatDuration(attempt.duration_ms)}</span>
+                        <span className="attempt-message" title={attempt.message || ""}>
+                          {attempt.message || "—"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              </Fragment>
+              );
+            })}
             {loading && rows.length === 0 && <Empty text="正在加载使用记录…" />}
             {!loading && rows.length === 0 && (
               <Empty text="当前筛选条件下没有使用记录" />
