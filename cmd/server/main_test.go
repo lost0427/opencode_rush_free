@@ -66,6 +66,19 @@ func insertUsageAt(t *testing.T, a *App, createdAt time.Time, model, status stri
 	}
 }
 
+func TestOpenCodeIDMatchesUUIDHexFormat(t *testing.T) {
+	for _, prefix := range []string{"msg", "ses"} {
+		id, err := openCodeID(prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		value := strings.TrimPrefix(id, prefix+"_")
+		if len(value) != 32 || strings.Trim(value, "0123456789abcdef") != "" {
+			t.Fatalf("OpenCode ID %q does not match %s_<uuid hex>", id, prefix)
+		}
+	}
+}
+
 func TestMigrateAddsNullableUsageColumnsToExistingUsageTable(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:legacy-usage-migration?mode=memory&cache=shared")
 	if err != nil {
@@ -767,7 +780,7 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 		t.Fatalf("vision supplier configuration was not isolated: %#v", cfg)
 	}
 	chatRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	resp, err := a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_test", "ses_test")
+	resp, err := a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_test", "ses_test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,8 +793,20 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	if chatHeaders.Get("Authorization") != "Bearer up-secret" || chatHeaders.Get("Content-Type") != "application/json" {
 		t.Fatalf("gateway-managed headers were not injected: %#v", chatHeaders)
 	}
+	if chatHeaders.Get("Accept") != "*/*" {
+		t.Fatalf("non-stream Accept header = %q", chatHeaders.Get("Accept"))
+	}
 	if chatHeaders.Get("X-Opencode-Project") != "global" || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Request"), "msg_") || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Session"), "ses_") {
 		t.Fatalf("OpenCode identity headers were not injected: %#v", chatHeaders)
+	}
+	resp, err = a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[],"stream":true}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_stream", "ses_test", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if accept := (<-chatHeadersCh).Get("Accept"); accept != "text/event-stream" {
+		t.Fatalf("stream Accept header = %q", accept)
 	}
 }
 

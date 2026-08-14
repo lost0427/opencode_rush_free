@@ -533,11 +533,13 @@ func randomKey() (string, error) {
 }
 
 func openCodeID(prefix string) (string, error) {
-	b := make([]byte, 12)
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s_%x%s", prefix, time.Now().UnixMilli(), base64.RawURLEncoding.EncodeToString(b)), nil
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%s_%x", prefix, b), nil
 }
 
 func hashToken(s string) string {
@@ -1493,7 +1495,7 @@ func (a *App) testUpstreamRequest(ctx context.Context, cfg upstreamConfig, body 
 		}
 	} else {
 		req, _ := http.NewRequestWithContext(ctx, "POST", "http://relaydesk.invalid", nil)
-		resp, err = a.forward(req, body, cfg, *p, "", "")
+		resp, err = a.forward(req, body, cfg, *p, "", "", false)
 	}
 	result := map[string]any{}
 	if p != nil {
@@ -1902,7 +1904,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			visionCfg := upstreamConfig{BaseURL: cfg.VisionBaseURL, APIKey: cfg.VisionAPIKey}
 			helperCtx, helperCancel := visionRequestContext(r)
 			helperRequest := r.Clone(helperCtx)
-			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, helperProxy, "", "")
+			helpResp, helpErr := a.forward(helperRequest, helpBody, visionCfg, helperProxy, "", "", false)
 			if helpErr != nil {
 				helperCancel()
 				lastErr = fmt.Errorf("vision helper request failed: %w", helpErr)
@@ -1982,7 +1984,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
 		attemptStarted := time.Now()
-		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID)
+		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID, parsed.Stream)
 		if e != nil {
 			lastErr = e
 			if resinMode && engineConfig.DynamicScoring {
@@ -2169,7 +2171,7 @@ func lastErrString(e error) string {
 	}
 	return e.Error()
 }
-func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, requestID, sessionID string) (*http.Response, error) {
+func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, requestID, sessionID string, stream bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -2181,6 +2183,11 @@ func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyR
 		req.Header.Set("X-Opencode-Session", sessionID)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	} else {
+		req.Header.Set("Accept", "*/*")
+	}
 	client, err := a.httpClient(p)
 	if err != nil {
 		return nil, err
