@@ -810,6 +810,51 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	}
 }
 
+func TestResponsesUsesResponsesEndpointAndConfiguredAuthorization(t *testing.T) {
+	a := testApp(t)
+	mux := http.NewServeMux()
+	a.routes(mux)
+	routeResponse := httptest.NewRecorder()
+	mux.ServeHTTP(routeResponse, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"alpha:free","input":"hello"}`)))
+	if routeResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("responses route status = %d body=%s", routeResponse.Code, routeResponse.Body.String())
+	}
+
+	requestCh := make(chan *http.Request, 1)
+	bodyCh := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCh <- r.Clone(r.Context())
+		body, _ := io.ReadAll(r.Body)
+		bodyCh <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	cfg := upstreamConfig{BaseURL: upstream.URL, APIKey: "up-secret", CustomHeaders: map[string]string{"X-Relay-Test": "enabled"}}
+	downstream := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	downstream.Header.Set("Authorization", "Bearer client-secret")
+	resp, err := a.forwardEndpoint(downstream, []byte(`{"model":"alpha:free","input":"hello","stream":true}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_test", "ses_test", true, "/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	request := <-requestCh
+	if request.URL.Path != "/v1/responses" {
+		t.Fatalf("upstream path = %q", request.URL.Path)
+	}
+	if request.Header.Get("Authorization") != "Bearer up-secret" || request.Header.Get("Authorization") == downstream.Header.Get("Authorization") {
+		t.Fatalf("upstream authorization = %q", request.Header.Get("Authorization"))
+	}
+	if request.Header.Get("X-Relay-Test") != "enabled" || request.Header.Get("Accept") != "text/event-stream" {
+		t.Fatalf("upstream headers = %#v", request.Header)
+	}
+	if got := string(<-bodyCh); got != `{"model":"alpha:free","input":"hello","stream":true}` {
+		t.Fatalf("upstream body = %s", got)
+	}
+}
+
 func TestVisionUseProxySettingAndDirectTransport(t *testing.T) {
 	a := testApp(t)
 

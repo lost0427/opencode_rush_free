@@ -654,6 +654,7 @@ func (a *App) routes(mux *http.ServeMux) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /v1/chat/completions", a.gatewayChat)
+	mux.HandleFunc("POST /v1/responses", a.gatewayResponses)
 	mux.HandleFunc("GET /v1/models", a.gatewayModels)
 	mux.HandleFunc("POST /api/auth/login", a.login)
 	mux.HandleFunc("POST /api/auth/logout", a.logout)
@@ -1717,6 +1718,14 @@ func sessionKey(r *http.Request, user json.RawMessage) string {
 }
 
 func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
+	a.gatewayRequest(w, r, "/chat/completions")
+}
+
+func (a *App) gatewayResponses(w http.ResponseWriter, r *http.Request) {
+	a.gatewayRequest(w, r, "/responses")
+}
+
+func (a *App) gatewayRequest(w http.ResponseWriter, r *http.Request, endpoint string) {
 	start := time.Now()
 	clientKey, authErr := a.authenticateClient(r)
 	if authErr != nil {
@@ -1984,7 +1993,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
 		attemptStarted := time.Now()
-		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID, parsed.Stream)
+		resp, e := a.forwardEndpoint(r, bodyToForward, cfg, p, requestID, upstreamSessionID, parsed.Stream, endpoint)
 		if e != nil {
 			lastErr = e
 			if resinMode && engineConfig.DynamicScoring {
@@ -2172,7 +2181,11 @@ func lastErrString(e error) string {
 	return e.Error()
 }
 func (a *App) forward(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, requestID, sessionID string, stream bool) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), bytes.NewReader(body))
+	return a.forwardEndpoint(r, body, cfg, p, requestID, sessionID, stream, "/chat/completions")
+}
+
+func (a *App) forwardEndpoint(r *http.Request, body []byte, cfg upstreamConfig, p ProxyRecord, requestID, sessionID string, stream bool, endpoint string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(r.Context(), "POST", upstreamEndpoint(cfg.BaseURL, endpoint), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
