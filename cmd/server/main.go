@@ -532,14 +532,61 @@ func randomKey() (string, error) {
 	return "ocp-" + strings.ReplaceAll(base64.RawURLEncoding.EncodeToString(b), "_", "-"), nil
 }
 
+const openCodeBase62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+var (
+	openCodeMu     sync.Mutex
+	openCodeLastMs int64
+	openCodeSeq    uint16
+)
+
+func openCodeBase62Encode(v uint64, width int) string {
+	b := make([]byte, width)
+	for i := width - 1; i >= 0; i-- {
+		b[i] = openCodeBase62Alphabet[v%62]
+		v /= 62
+	}
+	return string(b)
+}
+
 func openCodeID(prefix string) (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	// Fixed-length time-ordered ID: prefix + "_" + 12 lowercase hex + 14 base62.
+	// The 12 hex digits carry the Unix millisecond timestamp (48 bits, good
+	// until year 10889) so the time is extractable via parseInt(id.slice(4,16),16).
+	// Monotonicity within the same millisecond comes from a 12-bit per-ms
+	// sequence stored as the first 3 base62 chars (62^3 > 4096); ordering-wise
+	// this is equivalent to ms*4096+counter. The counter is kept in the suffix
+	// head instead of being shifted into the hex part so the timestamp still
+	// fits in 12 hex digits (ms<<12 alone already needs ~53 bits). The last 11
+	// base62 chars are crypto random. A logical clock (never goes backwards,
+	// bumps 1ms on sequence overflow) keeps IDs process-wide monotonic.
+	now := time.Now().UnixMilli()
+	openCodeMu.Lock()
+	if now > openCodeLastMs {
+		openCodeLastMs = now
+		openCodeSeq = 0
+	} else {
+		openCodeSeq++
+		if openCodeSeq > 0xFFF {
+			openCodeLastMs++
+			openCodeSeq = 0
+		}
+	}
+	ms := openCodeLastMs
+	seq := openCodeSeq
+	openCodeMu.Unlock()
+
+	rb := make([]byte, 11)
+	if _, err := rand.Read(rb); err != nil {
 		return "", err
 	}
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
-	return fmt.Sprintf("%s_%x", prefix, b), nil
+	var sb strings.Builder
+	sb.Grow(14)
+	sb.WriteString(openCodeBase62Encode(uint64(seq), 3))
+	for _, b := range rb {
+		sb.WriteByte(openCodeBase62Alphabet[b%62])
+	}
+	return fmt.Sprintf("%s_%012x%s", prefix, uint64(ms)&0xFFFFFFFFFFFF, sb.String()), nil
 }
 
 func hashToken(s string) string {

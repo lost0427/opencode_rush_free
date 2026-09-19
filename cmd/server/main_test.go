@@ -66,15 +66,57 @@ func insertUsageAt(t *testing.T, a *App, createdAt time.Time, model, status stri
 	}
 }
 
-func TestOpenCodeIDMatchesUUIDHexFormat(t *testing.T) {
-	for _, prefix := range []string{"msg", "ses"} {
-		id, err := openCodeID(prefix)
-		if err != nil {
-			t.Fatal(err)
+func TestOpenCodeIDIsTimeOrderedFixedLength(t *testing.T) {
+	isHex := func(s string) bool {
+		if len(s) != 12 {
+			return false
 		}
-		value := strings.TrimPrefix(id, prefix+"_")
-		if len(value) != 32 || strings.Trim(value, "0123456789abcdef") != "" {
-			t.Fatalf("OpenCode ID %q does not match %s_<uuid hex>", id, prefix)
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+		return true
+	}
+	isBase62 := func(s string) bool {
+		if len(s) != 14 {
+			return false
+		}
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z') {
+				return false
+			}
+		}
+		return true
+	}
+	for _, prefix := range []string{"msg", "ses"} {
+		start := time.Now().UnixMilli()
+		prev := ""
+		for i := 0; i < 1000; i++ {
+			id, err := openCodeID(prefix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(id) != len(prefix)+1+26 {
+				t.Fatalf("OpenCode ID %q has wrong length %d", id, len(id))
+			}
+			value := strings.TrimPrefix(id, prefix+"_")
+			if len(value) != 26 || !isHex(value[:12]) || !isBase62(value[12:]) {
+				t.Fatalf("OpenCode ID %q does not match %s_<12hex><14base62>", id, prefix)
+			}
+			ms, err := strconv.ParseInt(value[:12], 16, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ms < start-1000 || ms > time.Now().UnixMilli()+1000 {
+				t.Fatalf("OpenCode ID %q timestamp %d out of range", id, ms)
+			}
+			if prev != "" && id <= prev {
+				t.Fatalf("OpenCode IDs not monotonic: %q then %q", prev, id)
+			}
+			prev = id
 		}
 	}
 }
