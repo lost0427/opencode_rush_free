@@ -290,6 +290,12 @@ func TestFreeClassificationAndUsageParsing(t *testing.T) {
 	if ok, _ := classifyFree("paid", map[string]any{"pricing": map[string]any{"prompt": "0.1", "completion": "0"}}); ok {
 		t.Fatal("paid model classified as free")
 	}
+	if ok, reason := classifyFree("big-pickle", map[string]any{}); !ok || reason != "extra_free" {
+		t.Fatalf("big-pickle should be extra_free: ok=%v reason=%q", ok, reason)
+	}
+	if ok, _ := classifyFree("some-random-model", map[string]any{}); ok {
+		t.Fatal("unknown model classified as free")
+	}
 	u := parseUsageBytes([]byte(`{"usage":{"prompt_tokens":2,"completion_tokens":5,"total_tokens":7}}`))
 	if u == nil || *u.Total != 7 {
 		t.Fatalf("usage parsing failed: %#v", u)

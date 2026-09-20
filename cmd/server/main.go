@@ -59,6 +59,11 @@ type App struct {
 	usageInsertStmt         *sql.Stmt
 }
 
+// knownExtraFreeModels 是即使上游 /v1/models 的 id 不带 :-free/-free 后缀、
+// 也没有 pricing 字段，也必须视为免费模型的 ID（小写）。
+// 默认包含 OpenCode Zen 的 big-pickle；EXTRA_FREE_MODELS 环境变量可追加。
+var knownExtraFreeModels = map[string]bool{"big-pickle": true}
+
 type loginAttempt struct {
 	Failures     int
 	WindowStart  time.Time
@@ -259,6 +264,12 @@ func main() {
 	}
 	if looksLikePlaceholderSecret(sessionSecret) {
 		log.Print("SECURITY WARNING: SESSION_SECRET appears to be a placeholder and should be replaced")
+	}
+	for _, extra := range strings.Split(os.Getenv("EXTRA_FREE_MODELS"), ",") {
+		extra = strings.ToLower(strings.TrimSpace(extra))
+		if extra != "" {
+			knownExtraFreeModels[extra] = true
+		}
 	}
 	cookieSecure, err := envBool("COOKIE_SECURE", false)
 	if err != nil {
@@ -1574,6 +1585,9 @@ func boolInt(v bool) int {
 }
 func classifyFree(id string, m map[string]any) (bool, string) {
 	lowerID := strings.ToLower(id)
+	if knownExtraFreeModels[lowerID] {
+		return true, "extra_free"
+	}
 	suffix := strings.HasSuffix(lowerID, ":free") || strings.HasSuffix(lowerID, "-free")
 	pricingZero := false
 	if p, ok := m["pricing"].(map[string]any); ok {
