@@ -1,6 +1,8 @@
 .env
 *.db
 *.db-*
+RESIN-RETRY-OPTIMIZATION-PLAN.md
+error.txt
 opencode-proxy-linux
 opencode-proxy-linux-amd64
 bun-bridge.exe

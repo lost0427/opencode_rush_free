@@ -66,6 +66,23 @@ func insertUsageAt(t *testing.T, a *App, createdAt time.Time, model, status stri
 	}
 }
 
+func TestOpenCodeProjectIDIsRandomSHA1Hex(t *testing.T) {
+	seen := map[string]struct{}{}
+	for i := 0; i < 50; i++ {
+		id, err := openCodeProjectID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(id) != 40 || strings.Trim(id, "0123456789abcdef") != "" {
+			t.Fatalf("OpenCode project ID %q is not 40 lowercase hex chars", id)
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("OpenCode project ID %q repeated", id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
 func TestOpenCodeIDIsTimeOrderedFixedLength(t *testing.T) {
 	isHex := func(s string) bool {
 		if len(s) != 12 {
@@ -822,7 +839,7 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 		t.Fatalf("vision supplier configuration was not isolated: %#v", cfg)
 	}
 	chatRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	resp, err := a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_test", "ses_test", false)
+	resp, err := a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[]}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_test", "ses_test", "da39a3ee5e6b4b0d3255bfef95601890afd80709", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,10 +855,10 @@ func TestCustomUpstreamHeadersReachModelsAndChat(t *testing.T) {
 	if chatHeaders.Get("Accept") != "*/*" {
 		t.Fatalf("non-stream Accept header = %q", chatHeaders.Get("Accept"))
 	}
-	if chatHeaders.Get("X-Opencode-Project") != "global" || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Request"), "msg_") || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Session"), "ses_") {
+	if chatHeaders.Get("X-Opencode-Project") != "da39a3ee5e6b4b0d3255bfef95601890afd80709" || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Request"), "msg_") || !strings.HasPrefix(chatHeaders.Get("X-Opencode-Session"), "ses_") {
 		t.Fatalf("OpenCode identity headers were not injected: %#v", chatHeaders)
 	}
-	resp, err = a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[],"stream":true}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_stream", "ses_test", true)
+	resp, err = a.forward(chatRequest, []byte(`{"model":"alpha:free","messages":[],"stream":true}`), cfg, ProxyRecord{URI: upstream.URL}, "msg_stream", "ses_test", "da39a3ee5e6b4b0d3255bfef95601890afd80709", true)
 	if err != nil {
 		t.Fatal(err)
 	}
