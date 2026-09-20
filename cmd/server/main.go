@@ -673,6 +673,29 @@ func openCodeID(prefix string) (string, error) {
 	return fmt.Sprintf("%s_%012x%s", prefix, uint64(ms)&0xFFFFFFFFFFFF, sb.String()), nil
 }
 
+// opencodeUpstreamIdentity builds the OpenCode identity triple the upstream
+// expects on a chat completion. sessionKey is the client-derived session key
+// when available; empty means no client session, in which case a random
+// session ID is generated (the upstream probe path).
+func opencodeUpstreamIdentity(sessionKey string) (requestID, sessionID, projectID string, err error) {
+	requestID, err = openCodeID("msg")
+	if err != nil {
+		return "", "", "", err
+	}
+	projectID, err = openCodeProjectID()
+	if err != nil {
+		return "", "", "", err
+	}
+	if sessionKey == "" {
+		sessionID, err = openCodeID("ses")
+		if err != nil {
+			return "", "", "", err
+		}
+		return requestID, sessionID, projectID, nil
+	}
+	return requestID, "ses_" + sessionKey, projectID, nil
+}
+
 func hashToken(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return base64.RawURLEncoding.EncodeToString(h[:])
@@ -1629,36 +1652,36 @@ func (a *App) testUpstream(w http.ResponseWriter, r *http.Request) {
 	if shaped, _ := shapeFreeModelBody(body); shaped != nil {
 		body = shaped
 	}
+	requestID, sessionID, projectID, err := opencodeUpstreamIdentity("")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize upstream request identity"})
+		return
+	}
 	result := map[string]any{"model": model}
-	result["direct"] = a.testUpstreamRequest(r.Context(), cfg, body, nil)
+	result["direct"] = a.testUpstreamRequest(r.Context(), cfg, body, nil, requestID, sessionID, projectID)
 	p, engine, proxyErr := a.controlPlaneProxy()
 	if proxyErr != nil {
 		result["proxy"] = map[string]any{"status": "not_available", "message": proxyErr.Error()}
 		writeJSON(w, http.StatusOK, result)
 		return
 	}
-	proxyResult := a.testUpstreamRequest(r.Context(), cfg, body, &p)
+	proxyResult := a.testUpstreamRequest(r.Context(), cfg, body, &p, requestID, sessionID, projectID)
 	proxyResult["engine"] = engine
 	result["proxy"] = proxyResult
 	writeJSON(w, 200, result)
 }
 
-func (a *App) testUpstreamRequest(ctx context.Context, cfg upstreamConfig, body []byte, p *ProxyRecord) map[string]any {
-	var resp *http.Response
-	var err error
-	if p == nil {
-		req, requestErr := http.NewRequestWithContext(ctx, "POST", upstreamEndpoint(cfg.BaseURL, "/chat/completions"), strings.NewReader(string(body)))
-		if requestErr != nil {
-			err = requestErr
-		} else {
-			applyUpstreamHeaders(req, cfg)
-			req.Header.Set("Content-Type", "application/json")
-			resp, err = newBunTransport(ProxyRecord{}).RoundTrip(req)
-		}
-	} else {
-		req, _ := http.NewRequestWithContext(ctx, "POST", "http://relaydesk.invalid", nil)
-		resp, err = a.forward(req, body, cfg, *p, "", "", "", false)
+func (a *App) testUpstreamRequest(ctx context.Context, cfg upstreamConfig, body []byte, p *ProxyRecord, requestID, sessionID, projectID string) map[string]any {
+	// The probe must look identical to a real gateway request: the upstream free
+	// tier rejects requests without the OpenCode identity headers and a stream
+	// Accept header with 403, so route both direct and proxied probes through
+	// forward() the same way gatewayChat does.
+	proxy := ProxyRecord{}
+	if p != nil {
+		proxy = *p
 	}
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://relaydesk.invalid", nil)
+	resp, err := a.forward(req, body, cfg, proxy, requestID, sessionID, projectID, true)
 	result := map[string]any{}
 	if p != nil {
 		result["proxy_uri"] = p.URI
@@ -1987,23 +2010,10 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	requestSessionKey := sessionKey(r, parsed.User)
-	requestID, err := openCodeID("msg")
+	requestID, upstreamSessionID, projectID, err := opencodeUpstreamIdentity(requestSessionKey)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize upstream request identity"})
 		return
-	}
-	projectID, err := openCodeProjectID()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize upstream project identity"})
-		return
-	}
-	upstreamSessionID := "ses_" + requestSessionKey
-	if requestSessionKey == "" {
-		upstreamSessionID, err = openCodeID("ses")
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not initialize upstream session identity"})
-			return
-		}
 	}
 	var resinRoute *resinRequestRoute
 	if resinMode {
