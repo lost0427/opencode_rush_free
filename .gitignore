@@ -10,3 +10,4 @@ web/dist/
 web/tsconfig.tsbuildinfo
 web/test-results/
 node_modules/
+/server

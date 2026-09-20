@@ -1475,6 +1475,8 @@ func TestLogoutRevokesServerSession(t *testing.T) {
 
 func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 	a := testApp(t)
+	collapseStream := false
+	fallbackModel := ""
 	payload := bytes.Repeat([]byte("a"), 3<<20)
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -1489,7 +1491,7 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 		Body: io.NopCloser(bytes.NewReader(payload)),
 	}
 	recorder := httptest.NewRecorder()
-	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now())
+	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now(), collapseStream, fallbackModel)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
@@ -1509,6 +1511,8 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 
 func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 	a := testApp(t)
+	collapseStream := false
+	fallbackModel := ""
 	stream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","content":""}}]}`,
 		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
@@ -1522,7 +1526,7 @@ func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(stream)),
 	}
 	recorder := httptest.NewRecorder()
-	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond))
+	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond), collapseStream, fallbackModel)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
@@ -1538,7 +1542,7 @@ func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream failed"}}`)),
 	}
-	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second))
+	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second), collapseStream, fallbackModel)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}

@@ -1,7 +1,7 @@
 FROM node:22-alpine AS frontend
 WORKDIR /src/web
 COPY web/package*.json ./
-RUN npm ci
+RUN npm config set registry https://registry.npmmirror.com && npm ci --registry=https://registry.npmmirror.com --fetch-retries=8 --fetch-timeout=60000
 COPY web/ ./
 RUN npm run build
 

@@ -1615,6 +1615,9 @@ func (a *App) testUpstream(w http.ResponseWriter, r *http.Request) {
 		"max_tokens": 1,
 		"stream":     false,
 	})
+	if shaped, _ := shapeFreeModelBody(body); shaped != nil {
+		body = shaped
+	}
 	result := map[string]any{"model": model}
 	result["direct"] = a.testUpstreamRequest(r.Context(), cfg, body, nil)
 	p, engine, proxyErr := a.controlPlaneProxy()
@@ -2006,6 +2009,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 	retryCount := 0
 	used := map[int64]struct{}{}
 	attemptSummary := []map[string]any{}
+	collapseResponse := false
 	for i := 0; i < attempts; i++ {
 		if requestErr := r.Context().Err(); requestErr != nil {
 			downstreamErr = requestErr
@@ -2138,7 +2142,12 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			a.recordUsageKindWithEngine("vision_helper", cfg.VisionModel, helperProxyID, helperProxyURI, helperRouteEngine, "success", helpStatus, time.Since(helperStarted), helpFirstToken, i, helpTokens, nil)
 		}
 		attemptStarted := time.Now()
-		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID, parsed.Stream)
+		shapedBody, shaped := shapeFreeModelBody(bodyToForward)
+		if shaped {
+			bodyToForward = shapedBody
+		}
+		collapseResponse = !parsed.Stream && shaped
+		resp, e := a.forward(r, bodyToForward, cfg, p, requestID, upstreamSessionID, parsed.Stream || shaped)
 		if e != nil {
 			lastErr = e
 			if resinMode && engineConfig.DynamicScoring {
@@ -2208,7 +2217,7 @@ func (a *App) gatewayChat(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start)
+		tokens, upstreamError, firstTokenLatency, copyErr := a.copyResponse(w, resp, start, collapseResponse, resolvedModel)
 		var proxyID *int64
 		if p.ID > 0 {
 			proxyID = &p.ID
@@ -2545,7 +2554,7 @@ func (a *App) buildHTTPClient(p ProxyRecord) (*http.Client, interface{ CloseIdle
 	transport := newBunTransport(p)
 	return &http.Client{Transport: transport}, transport, nil
 }
-func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time) (*tokenUsage, string, *time.Duration, error) {
+func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt time.Time, collapseStream bool, fallbackModel string) (*tokenUsage, string, *time.Duration, error) {
 	defer resp.Body.Close()
 	blocked := make(map[string]struct{}, len(blockedDownstreamHeaders)+4)
 	for name := range blockedDownstreamHeaders {
@@ -2566,8 +2575,32 @@ func (a *App) copyResponse(w http.ResponseWriter, resp *http.Response, startedAt
 			w.Header().Add(k, x)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if collapseStream && resp.StatusCode >= 200 && resp.StatusCode < 300 && strings.Contains(contentType, "text/event-stream") {
+		body, usage, firstTokenLatency, collapseErr := collapseChatCompletionStream(resp.Body, fallbackModel, startedAt)
+		if collapseErr == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Del("Content-Length")
+			w.WriteHeader(resp.StatusCode)
+			_, writeErr := w.Write(body)
+			if writeErr != nil {
+				collapseErr = writeErr
+			}
+			return usage, "", firstTokenLatency, collapseErr
+		}
+		errorBody, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": truncateError(collapseErr.Error()),
+				"type":    "upstream_stream_error",
+				"status":  http.StatusBadGateway,
+			},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write(errorBody)
+		return nil, "", nil, collapseErr
+	}
+	w.WriteHeader(resp.StatusCode)
 	captured := &limitedCapture{limit: 2 << 20}
 	var firstTokenLatency *time.Duration
 	markFirstToken := func() {
