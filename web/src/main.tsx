@@ -1796,6 +1796,117 @@ function ModelAliasesPanel({ models, notify }: { models: Model[]; notify: (value
   </section>;
 }
 
+function ExtraFreeModelsPanel({
+  notify,
+  reload,
+}: {
+  notify: (value: string, type?: ToastType) => void;
+  reload: () => void;
+}) {
+  const [items, setItems] = useState<string[]>([]);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try {
+      const d = await api("/api/settings/extra-free-models");
+      setItems(Array.isArray(d.items) ? d.items : []);
+    } catch (error) {
+      notify((error as Error).message, "error");
+    }
+  }, [notify]);
+  useEffect(() => void load(), [load]);
+  const add = () => {
+    const ids = draft
+      .split(/[\n,]+/)
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (!ids.length) return;
+    const seen = new Set(items.map((id) => id.toLowerCase()));
+    const next: string[] = [];
+    for (const id of ids) {
+      const key = id.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      next.push(id);
+    }
+    if (!next.length) {
+      notify("这些模型已在列表中", "warning");
+      return;
+    }
+    setItems([...items, ...next]);
+    setDraft("");
+  };
+  const persist = async () => {
+    setBusy(true);
+    try {
+      const d = await api("/api/settings/extra-free-models", {
+        method: "PUT",
+        body: JSON.stringify({ items }),
+      });
+      setItems(Array.isArray(d.items) ? d.items : []);
+      notify("额外免费模型已保存，刷新模型后生效");
+      reload();
+    } catch (e) {
+      notify((e as Error).message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <section className="panel extra-free-panel">
+    <div className="panel-head">
+      <div>
+        <span className="eyebrow">EXTRA FREE MODELS</span>
+        <h3>额外免费模型</h3>
+        <p className="muted">把上游没标记为免费、但实际可用的模型 ID 加入白名单。</p>
+      </div>
+      <span className="count-chip">{items.length} added</span>
+    </div>
+    <div className="extra-free-add">
+      <label>
+        模型 ID（支持逗号或换行批量添加）
+        <input
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              add();
+            }
+          }}
+          placeholder="provider/model-id"
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </label>
+      <button className="secondary" onClick={add} disabled={busy || !draft.trim()}>
+        添加
+      </button>
+    </div>
+    {items.length > 0 && <div className="extra-free-list">
+      {items.map((id) => (
+        <span className="chip" key={id}>
+          <code>{id}</code>
+          <button
+            type="button"
+            className="chip-x"
+            title="移除"
+            disabled={busy}
+            onClick={() => setItems((current) => current.filter((item) => item !== id))}
+          >
+            <X size={12} />
+          </button>
+        </span>
+      ))}
+    </div>}
+    <div className="extra-free-actions">
+      <button className="primary" onClick={persist} disabled={busy}>
+        保存
+      </button>
+      <p className="muted small">保存后点击上方“刷新模型”，这些 ID 就会进入 Free 模型列表。</p>
+    </div>
+  </section>;
+}
+
 function Models({
   models,
   upstream,
@@ -2146,6 +2257,7 @@ function Models({
           {models.length === 0 && <Empty text="刷新上游以发现 Free 模型" />}
         </div>
       </section>
+      <ExtraFreeModelsPanel notify={notify} reload={reload} />
       <ModelAliasesPanel models={models} notify={notify} />
       <ClientKeysPanel notify={notify} />
     </div>

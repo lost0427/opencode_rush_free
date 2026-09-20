@@ -139,6 +139,72 @@ describe("operator workflows", () => {
     await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith("/api/client-keys/2", expect.objectContaining({ method: "DELETE" })));
   });
 
+  it("adds and persists an extra free model from the models screen", async () => {
+    const notify = vi.fn();
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/settings/extra-free-models" && init?.method === "PUT")
+        return json({ ok: true, items: ["alpha:free", "custom/free-model"] });
+      if (path === "/api/settings/extra-free-models") return json({ items: ["alpha:free"] });
+      if (path === "/api/model-aliases") return json([]);
+      if (path === "/api/client-keys") return json([]);
+      return json({});
+    });
+    render(<Models models={[]} upstream={{}} reload={() => {}} notify={notify} />);
+    await screen.findByText("额外免费模型");
+    const input = screen.getByPlaceholderText("provider/model-id") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "custom/free-model" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+    await waitFor(() => expect(screen.getByText("custom/free-model")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        "/api/settings/extra-free-models",
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+    const putCall = vi
+      .mocked(fetch)
+      .mock.calls.find(
+        ([url, init]) =>
+          String(url) === "/api/settings/extra-free-models" &&
+          (init as RequestInit | undefined)?.method === "PUT",
+      );
+    const body = JSON.parse(String((putCall?.[1] as RequestInit)?.body));
+    expect(body.items).toEqual(["alpha:free", "custom/free-model"]);
+    await waitFor(() => expect(notify).toHaveBeenCalledWith(expect.stringContaining("额外免费模型已保存")));
+  });
+
+  it("removes an extra free model chip before saving", async () => {
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/settings/extra-free-models") return json({ items: ["alpha:free", "beta:free"] });
+      if (path === "/api/model-aliases") return json([]);
+      if (path === "/api/client-keys") return json([]);
+      return json({});
+    });
+    render(<Models models={[]} upstream={{}} reload={() => {}} notify={vi.fn()} />);
+    await screen.findByText("beta:free");
+    fireEvent.click(screen.getAllByTitle("移除")[0]);
+    await waitFor(() => expect(screen.queryByText("alpha:free")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+        "/api/settings/extra-free-models",
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+    const putCall = vi
+      .mocked(fetch)
+      .mock.calls.find(
+        ([url, init]) =>
+          String(url) === "/api/settings/extra-free-models" &&
+          (init as RequestInit | undefined)?.method === "PUT",
+      );
+    const body = JSON.parse(String((putCall?.[1] as RequestInit)?.body));
+    expect(body.items).toEqual(["beta:free"]);
+  });
+
   it("updates the model policy from the model status control", async () => {
     const reload = vi.fn();
     vi.mocked(fetch).mockImplementation(async (input, init) => {

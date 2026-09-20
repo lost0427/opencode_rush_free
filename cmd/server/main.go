@@ -59,10 +59,77 @@ type App struct {
 	usageInsertStmt         *sql.Stmt
 }
 
-// knownExtraFreeModels 是即使上游 /v1/models 的 id 不带 :-free/-free 后缀、
+// extraFreeSet 是即使上游 /v1/models 的 id 不带 :-free/-free 后缀、
 // 也没有 pricing 字段，也必须视为免费模型的 ID（小写）。
-// 默认包含 OpenCode Zen 的 big-pickle；EXTRA_FREE_MODELS 环境变量可追加。
-var knownExtraFreeModels = map[string]bool{"big-pickle": true}
+// 初始值来自控制台保存的列表（settings 表）；首次运行且未保存过时
+// 回落到 EXTRA_FREE_MODELS 环境变量（默认 big-pickle）。运行期可在
+// 设置页动态增删，读写由 extraFreeMu 保护。
+var (
+	extraFreeMu  sync.RWMutex
+	extraFreeSet = map[string]bool{"big-pickle": true}
+)
+
+const extraFreeModelsSettingKey = "extra_free_models"
+
+// normalizeExtraFreeModels 规范化模型 ID 列表：小写、去空白、去空项、去重并排序。
+func normalizeExtraFreeModels(items []string) []string {
+	seen := make(map[string]bool, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		id := strings.ToLower(strings.TrimSpace(item))
+		if id != "" && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// currentExtraFreeModels 返回当前生效的额外免费模型列表（小写、排序）。
+func currentExtraFreeModels() []string {
+	extraFreeMu.RLock()
+	defer extraFreeMu.RUnlock()
+	out := make([]string, 0, len(extraFreeSet))
+	for id := range extraFreeSet {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// setExtraFreeModels 用规范化后的列表整体替换当前集合（自动加锁）。
+func setExtraFreeModels(items []string) {
+	norm := normalizeExtraFreeModels(items)
+	next := make(map[string]bool, len(norm))
+	for _, id := range norm {
+		next[id] = true
+	}
+	extraFreeMu.Lock()
+	extraFreeSet = next
+	extraFreeMu.Unlock()
+}
+
+// seedExtraFreeModels 启动时加载额外免费模型：优先用控制台保存过的列表，
+// 否则用 EXTRA_FREE_MODELS 环境变量（逗号分隔）。
+func seedExtraFreeModels(db *sql.DB) {
+	var stored string
+	if err := db.QueryRow("SELECT value FROM settings WHERE key=?", extraFreeModelsSettingKey).Scan(&stored); err == nil && stored != "" {
+		var items []string
+		if json.Unmarshal([]byte(stored), &items) == nil {
+			setExtraFreeModels(items)
+			return
+		}
+	}
+	var envItems []string
+	for _, extra := range strings.Split(os.Getenv("EXTRA_FREE_MODELS"), ",") {
+		extra = strings.ToLower(strings.TrimSpace(extra))
+		if extra != "" {
+			envItems = append(envItems, extra)
+		}
+	}
+	setExtraFreeModels(envItems)
+}
 
 type loginAttempt struct {
 	Failures     int
@@ -265,12 +332,7 @@ func main() {
 	if looksLikePlaceholderSecret(sessionSecret) {
 		log.Print("SECURITY WARNING: SESSION_SECRET appears to be a placeholder and should be replaced")
 	}
-	for _, extra := range strings.Split(os.Getenv("EXTRA_FREE_MODELS"), ",") {
-		extra = strings.ToLower(strings.TrimSpace(extra))
-		if extra != "" {
-			knownExtraFreeModels[extra] = true
-		}
-	}
+	seedExtraFreeModels(db)
 	cookieSecure, err := envBool("COOKIE_SECURE", false)
 	if err != nil {
 		log.Fatal(err)
@@ -736,6 +798,8 @@ func (a *App) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/settings/models/refresh", a.requireAdmin(a.refreshModels))
 	mux.HandleFunc("GET /api/settings/model-refresh", a.requireAdmin(a.getModelRefreshSettings))
 	mux.HandleFunc("PUT /api/settings/model-refresh", a.requireAdmin(a.putModelRefreshSettings))
+	mux.HandleFunc("GET /api/settings/extra-free-models", a.requireAdmin(a.getExtraFreeModels))
+	mux.HandleFunc("PUT /api/settings/extra-free-models", a.requireAdmin(a.putExtraFreeModels))
 	mux.HandleFunc("GET /api/models", a.requireAdmin(a.listModels))
 	mux.HandleFunc("GET /api/models/free", a.requireAdmin(a.listFreeModels))
 	mux.HandleFunc("PATCH /api/models/{id}/policy", a.requireAdmin(a.patchModelPolicy))
@@ -1093,6 +1157,32 @@ func (a *App) putUsageRetention(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "usage_retention_days": in.Days})
+}
+
+func (a *App) getExtraFreeModels(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"items": currentExtraFreeModels()})
+}
+
+func (a *App) putExtraFreeModels(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Items []string `json:"items"`
+	}
+	if readJSON(r, &in) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	items := normalizeExtraFreeModels(in.Items)
+	raw, err := json.Marshal(items)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not encode extra free models"})
+		return
+	}
+	if _, err := a.db.Exec("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", extraFreeModelsSettingKey, string(raw)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not save extra free models"})
+		return
+	}
+	setExtraFreeModels(items)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": items})
 }
 
 func (a *App) clientKeyConfigured() bool {
@@ -1585,7 +1675,10 @@ func boolInt(v bool) int {
 }
 func classifyFree(id string, m map[string]any) (bool, string) {
 	lowerID := strings.ToLower(id)
-	if knownExtraFreeModels[lowerID] {
+	extraFreeMu.RLock()
+	_, extra := extraFreeSet[lowerID]
+	extraFreeMu.RUnlock()
+	if extra {
 		return true, "extra_free"
 	}
 	suffix := strings.HasSuffix(lowerID, ":free") || strings.HasSuffix(lowerID, "-free")
