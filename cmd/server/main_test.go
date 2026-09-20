@@ -307,9 +307,77 @@ func TestFreeClassificationAndUsageParsing(t *testing.T) {
 	if ok, _ := classifyFree("paid", map[string]any{"pricing": map[string]any{"prompt": "0.1", "completion": "0"}}); ok {
 		t.Fatal("paid model classified as free")
 	}
+	if ok, reason := classifyFree("big-pickle", map[string]any{}); !ok || reason != "extra_free" {
+		t.Fatalf("big-pickle should be extra_free: ok=%v reason=%q", ok, reason)
+	}
+	if ok, _ := classifyFree("some-random-model", map[string]any{}); ok {
+		t.Fatal("unknown model classified as free")
+	}
 	u := parseUsageBytes([]byte(`{"usage":{"prompt_tokens":2,"completion_tokens":5,"total_tokens":7}}`))
 	if u == nil || *u.Total != 7 {
 		t.Fatalf("usage parsing failed: %#v", u)
+	}
+}
+
+func TestExtraFreeModelsSettingsAndClassification(t *testing.T) {
+	defer setExtraFreeModels([]string{"big-pickle"})
+	a := testApp(t)
+
+	get := httptest.NewRecorder()
+	a.getExtraFreeModels(get, httptest.NewRequest(http.MethodGet, "/api/settings/extra-free-models", nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET failed: %d", get.Code)
+	}
+	var initial struct {
+		Items []string `json:"items"`
+	}
+	if err := json.NewDecoder(get.Body).Decode(&initial); err != nil {
+		t.Fatal(err)
+	}
+	if len(initial.Items) != 1 || initial.Items[0] != "big-pickle" {
+		t.Fatalf("default extra free models are not big-pickle: %#v", initial.Items)
+	}
+
+	put := httptest.NewRecorder()
+	a.putExtraFreeModels(put, httptest.NewRequest(http.MethodPut, "/api/settings/extra-free-models", strings.NewReader(`{"items":["  Beta/FREE ","alpha:free","","ALPHA:free","beta/free"]}`)))
+	var updated struct {
+		Items []string `json:"items"`
+	}
+	if put.Code != http.StatusOK {
+		t.Fatalf("PUT failed: %d", put.Code)
+	}
+	if err := json.NewDecoder(put.Body).Decode(&updated); err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Items) != 2 || updated.Items[0] != "alpha:free" || updated.Items[1] != "beta/free" {
+		t.Fatalf("PUT did not normalize/dedupe: %#v", updated.Items)
+	}
+
+	again := httptest.NewRecorder()
+	a.getExtraFreeModels(again, httptest.NewRequest(http.MethodGet, "/api/settings/extra-free-models", nil))
+	var persisted struct {
+		Items []string `json:"items"`
+	}
+	if err := json.NewDecoder(again.Body).Decode(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Items) != 2 || persisted.Items[0] != "alpha:free" || persisted.Items[1] != "beta/free" {
+		t.Fatalf("GET did not return persisted items: %#v", persisted.Items)
+	}
+
+	if ok, reason := classifyFree("beta/free", map[string]any{}); !ok || reason != "extra_free" {
+		t.Fatalf("saved model not classified as extra_free: ok=%v reason=%q", ok, reason)
+	}
+	if ok, _ := classifyFree("alpha:free", map[string]any{}); !ok {
+		t.Fatal("saved model with :free suffix should also be free")
+	}
+	if ok, _ := classifyFree("some-unknown-model", map[string]any{}); ok {
+		t.Fatal("unknown model classified as free")
+	}
+
+	seedExtraFreeModels(a.db)
+	if ok, _ := classifyFree("beta/free", map[string]any{}); !ok {
+		t.Fatal("persisted extra free models were not re-seeded on restart")
 	}
 }
 
@@ -1424,6 +1492,8 @@ func TestLogoutRevokesServerSession(t *testing.T) {
 
 func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 	a := testApp(t)
+	collapseStream := false
+	fallbackModel := ""
 	payload := bytes.Repeat([]byte("a"), 3<<20)
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -1438,7 +1508,7 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 		Body: io.NopCloser(bytes.NewReader(payload)),
 	}
 	recorder := httptest.NewRecorder()
-	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now())
+	_, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now(), collapseStream, fallbackModel)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
@@ -1458,6 +1528,8 @@ func TestCopyResponseStreamsFullBodyAndFiltersHeaders(t *testing.T) {
 
 func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 	a := testApp(t)
+	collapseStream := false
+	fallbackModel := ""
 	stream := strings.Join([]string{
 		`data: {"choices":[{"delta":{"role":"assistant","content":""}}]}`,
 		`data: {"choices":[{"delta":{"content":"hello"}}]}`,
@@ -1471,7 +1543,7 @@ func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 		Body:       io.NopCloser(strings.NewReader(stream)),
 	}
 	recorder := httptest.NewRecorder()
-	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond))
+	usage, _, firstToken, copyErr := a.copyResponse(recorder, resp, time.Now().Add(-50*time.Millisecond), collapseStream, fallbackModel)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}
@@ -1487,7 +1559,7 @@ func TestCopyResponseTracksStreamingContentAndIgnoresErrorBodies(t *testing.T) {
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"upstream failed"}}`)),
 	}
-	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second))
+	_, _, errorFirstToken, copyErr := a.copyResponse(httptest.NewRecorder(), errorResp, time.Now().Add(-time.Second), collapseStream, fallbackModel)
 	if copyErr != nil {
 		t.Fatal(copyErr)
 	}

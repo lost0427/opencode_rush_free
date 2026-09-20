@@ -11,6 +11,7 @@
 
 Relay Desk 使用单实例 Go + SQLite，支持上游模型、HTTP/HTTPS/SOCKS5 代理池、Resin 路由、Client Key、模型别名、探测、统计和 Webhook 告警。
 
+
 ## 快速开始
 
 ### Docker Compose（推荐）
@@ -102,7 +103,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | --- | --- |
 | 设置 | `/api/settings/upstream`、`/api/settings/proxy-engine`、`/api/settings/routing` |
 | Client Key | `/api/client-keys`、`/api/client-keys/{id}/rotate` |
-| 模型 | `/api/models`、`/api/settings/models/refresh`、`/api/model-aliases` |
+| 模型 | `/api/models`、`/api/settings/models/refresh`、`/api/model-aliases`、`/api/settings/extra-free-models` |
 | 代理 | `/api/proxies`、`/api/proxies/import`、`/api/proxy-probes` |
 | 统计 | `/api/stats/*`、`/api/usage/*` |
 | 告警 | `/api/settings/alerts` |

@@ -25,6 +25,8 @@ services:
     env_file:
       - .env
     environment:
+      # 容器内固定监听 8080；宿主机映射端口由 .env 的 PORT 决定
+      PORT: "8080"
       WEB_DIR: /app/web/dist
       DATABASE_PATH: /data/app.db
     extra_hosts:
